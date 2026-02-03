@@ -1,6 +1,7 @@
 #include "graphics/LVGL/LVGLGraphics.h"
 #include "assert.h"
 #include "util/ILog.h"
+#include "graphics/LVGL/lv_lodepng_rgb565.h"
 
 LVGLGraphics::LVGLGraphics(uint16_t width, uint16_t height) : screenWidth(width), screenHeight(height) {}
 
@@ -11,6 +12,11 @@ void LVGLGraphics::init(void)
     lv_log_register_print_cb(lv_debug);
 #endif
     lv_init();
+
+    // Prefer RGB565 decoding for PNGs (e.g., SD card images) to reduce RAM/CPU.
+    // This decoder is registered after lv_init so it takes precedence over LVGL's default lodepng decoder.
+    lv_lodepng_rgb565_init();
+
 #if LV_USE_LOG
     lv_log_register_print_cb(lv_debug);
 #endif
