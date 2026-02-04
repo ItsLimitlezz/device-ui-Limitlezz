@@ -140,6 +140,32 @@ Graphics using <a href="https://lvgl.io/" target="_blank">LVGL</a> library
       - [x] Pan & Zoom
       - [x] Node locations
       - [ ] Location precision
+
+#### Map tile storage format (PNG default, BIN optional)
+
+By default, the map expects **raster PNG tiles** on the SD card / filesystem.
+
+**Folder layout (same for PNG and BIN):**
+
+- `/<prefix>/<style><z>/<x>/<y>.<ext>`
+
+Where:
+- `<prefix>` is typically `/maps` (or `/map` when using a flat, style-less layout)
+- `<style>` is optional and should end with `/` when present (e.g. `osm/`, `atlas/`)
+- `<ext>` is `png` by default, but can be `bin` when enabled
+
+Examples:
+- PNG tiles (default): `/maps/osm/13/2271/3486.png`
+- BIN tiles with styles: `/maps/osm/13/2271/3486.bin`
+- BIN tiles without styles: `/map/13/2271/3486.bin`
+
+**Enabling BIN tiles (additive, does not change default):**
+
+Set the build flag:
+- `-D MUI_MAP_TILE_FORMAT_DEFAULT=\"bin\"`
+
+This changes the expected tile file extension to `.bin` while keeping the same `z/x/y` directory structure and optional style folders.
+
     - [ ] Settings
       - [ ] Basic Settings
         - [x] User name
