@@ -2,9 +2,11 @@
 
 #if LV_USE_LODEPNG
 
-#include "lvgl/src/draw/lv_image_decoder_private.h"
-#include "lvgl/src/core/lv_global.h"
-#include "lvgl/src/libs/lodepng/lodepng.h"
+// NOTE: PlatformIO typically adds the LVGL library directory itself to include paths.
+// Use paths relative to the LVGL root (not "lvgl/") so this compiles in native-mui.
+#include "src/draw/lv_image_decoder_private.h"
+#include "src/core/lv_global.h"
+#include "src/libs/lodepng/lodepng.h"
 
 #include <stdlib.h>
 

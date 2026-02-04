@@ -364,11 +364,57 @@ void TFTView_320x240::init_screens(void)
                 objects.settings_channel6_label, objects.settings_channel7_label};
 
     channelGroup = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+#ifndef MUI_DEFAULT_PANEL_MAP
     ui_set_active(objects.home_button, objects.home_panel, objects.top_panel);
+#else
+    // Start directly on the Map panel (standalone sim convenience)
+    ILOG_INFO("MUI_DEFAULT_PANEL_MAP: starting on Map panel");
+    ui_set_active(objects.map_button, objects.map_panel, objects.top_map_panel);
+#endif
     ui_events_init();
 
     // load main screen
     lv_screen_load_anim(objects.main_screen, LV_SCR_LOAD_ANIM_NONE, 300, 0, false);
+
+#ifdef MUI_DEFAULT_PANEL_MAP
+    // IMPORTANT: When we default to the map panel at boot, we must also initialize the MapPanel.
+    // Normally this happens when the user navigates to the map via UI events; skipping it leaves a blank/gray panel.
+    ILOG_INFO("MUI_DEFAULT_PANEL_MAP: calling loadMap() at boot");
+    loadMap();
+    // Also force a known-good default location/zoom that we have tiles for in the simulator FS.
+    // This is Miles-only sim behavior (do not include in upstream PR).
+    if (map) {
+        ILOG_INFO("MUI_DEFAULT_PANEL_MAP: sim home override -> Miami z=13");
+        map->setHomeLocation(25.8175f, -80.1229f); // Miami/Fontainebleau
+        map->setZoom(13);
+        map->forceRedraw(false);
+    } else {
+        ILOG_WARN("MUI_DEFAULT_PANEL_MAP: loadMap() did not create map instance");
+    }
+
+    // Deterministic: some init paths can bounce us back to Home after init.
+    // Re-apply the Map panel shortly after init completes.
+    // (Miles-only behavior; do not include in upstream PR.)
+    auto force_map_cb = [](lv_timer_t *t) {
+        auto self = static_cast<TFTView_320x240 *>(t->user_data);
+        if (!self)
+            return;
+        ILOG_INFO("MUI_DEFAULT_PANEL_MAP: forcing Map panel after init");
+        self->loadMap();
+        if (self->map) {
+            ILOG_INFO("MUI_DEFAULT_PANEL_MAP: sim home override (timer) -> Miami z=13");
+            self->map->setHomeLocation(25.8175f, -80.1229f);
+            self->map->setZoom(13);
+            self->map->forceRedraw(false);
+        } else {
+            ILOG_WARN("MUI_DEFAULT_PANEL_MAP: map instance missing in timer");
+        }
+        self->ui_set_active(objects.map_button, objects.map_panel, objects.top_map_panel);
+        lv_timer_del(t);
+    };
+    lv_timer_t *tmr = lv_timer_create(force_map_cb, 400, this);
+    (void)tmr;
+#endif
 
     // re-configuration based on capabilities
     if (!displaydriver->hasLight())
@@ -421,7 +467,13 @@ void TFTView_320x240::init_screens(void)
 #endif
 
     setInputButtonLabel();
+#ifndef MUI_DEFAULT_PANEL_MAP
     lv_group_focus_obj(objects.home_button);
+#else
+    // Re-apply map as active at the end of init to avoid any later init code bringing us back to Home.
+    ui_set_active(objects.map_button, objects.map_panel, objects.top_map_panel);
+    lv_group_focus_obj(objects.map_button);
+#endif
 
     // remember position of top node panel button for group linked list
     lv_ll_t *lv_group_ll = &lv_group_get_default()->obj_ll;
@@ -2672,6 +2724,15 @@ void TFTView_320x240::loadMap(void)
             }
         }
         updateLocationMap(map->getObjectsOnMap());
+
+#ifdef MUI_DEFAULT_PANEL_MAP
+        // Miles-only simulator behavior:
+        // Force a known location/zoom where we have pre-generated `.bin` tiles.
+        ILOG_INFO("MUI_DEFAULT_PANEL_MAP: loadMap() forcing Miami z=13");
+        map->setHomeLocation(25.8175f, -80.1229f);
+        map->setZoom(13);
+        map->forceRedraw(false);
+#endif
     }
 
     if (sdCard) {
