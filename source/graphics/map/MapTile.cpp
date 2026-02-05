@@ -5,6 +5,7 @@
 #include "util/ILog.h"
 
 #include <assert.h>
+#include <cstring>
 
 LV_IMAGE_DECLARE(img_no_tile_image);
 
@@ -51,6 +52,16 @@ bool MapTile::load(lv_obj_t *p, int16_t posx, int16_t posy, const lv_image_dsc_t
     lv_image_set_src(img, fname);
     if (lv_image_get_src((lv_obj_t *)img)) {
         result = true;
+    } else {
+        // Fallback: try the alternate prefix (/map <-> /maps) for compatibility
+        const char *fallbackPrefix = (std::strcmp(MapTileSettings::getPrefix(), "/map") == 0) ? "/maps" : "/map";
+        sprintf(&fname[1], ":%s/%s%d/%d/%d.%s", fallbackPrefix, MapTileSettings::getTileStyle(), zoomLevel, xTile, yTile,
+                MapTileSettings::getTileFormat());
+        ILOG_DEBUG("SD file fallback: %s", fname);
+        lv_image_set_src(img, fname);
+        if (lv_image_get_src((lv_obj_t *)img)) {
+            result = true;
+        }
     }
 #endif
     // use configured TileService
