@@ -11,9 +11,6 @@ float MapTileSettings::defaultLon = -0.1214328476f;
 char MapTileSettings::prefix[10] = "/maps";   // default map tile directory
 char MapTileSettings::tileStyle[20] = "";     // { osm/, atlas/, atlas-mobile/, ...}
 
-// Default stays PNG; enable BIN via -D MUI_MAP_TILE_FORMAT_DEFAULT="bin"
-#ifndef MUI_MAP_TILE_FORMAT_DEFAULT
-#define MUI_MAP_TILE_FORMAT_DEFAULT "png"
-#endif
-char MapTileSettings::tileFormat[10] = MUI_MAP_TILE_FORMAT_DEFAULT; // e.g. "png", "jpg", "bin"
+// BIN embedded by default (LVGL RGB565 .bin tiles)
+char MapTileSettings::tileFormat[10] = "bin"; // e.g. "png", "jpg", "bin"
 bool MapTileSettings::debug = false;
