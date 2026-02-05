@@ -28,6 +28,7 @@
 #include <random>
 #include <sstream>
 #include <time.h>
+#include <vector>
 
 #if defined(ARCH_PORTDUINO)
 #include "PortduinoFS.h"
@@ -5486,7 +5487,11 @@ void TFTView_320x240::purgeNode(uint32_t nodeNum)
  */
 bool TFTView_320x240::applyNodesFilter(uint32_t nodeNum, bool reset)
 {
-    lv_obj_t *panel = nodes[nodeNum];
+    auto itPanel = nodes.find(nodeNum);
+    if (itPanel == nodes.end() || itPanel->second == nullptr) {
+        return false;
+    }
+    lv_obj_t *panel = itPanel->second;
     bool hide = false;
     if (nodeNum != ownNode /* && filter.active*/) { // TODO
         if (lv_obj_has_state(objects.nodes_filter_unknown_switch, LV_STATE_CHECKED)) {
@@ -7019,20 +7024,31 @@ void TFTView_320x240::updateNodesStatus(void)
  */
 void TFTView_320x240::updateNodesFiltered(bool reset)
 {
-    static auto it = nodes.begin();
+    static std::vector<uint32_t> nodeOrder;
+    static size_t idx = 0;
+
     if (reset || nodesChanged) {
+        nodeOrder.clear();
+        nodeOrder.reserve(nodes.size());
+        for (const auto &kv : nodes) {
+            if (kv.second) {
+                nodeOrder.push_back(kv.first);
+            }
+        }
+        idx = 0;
         nodesFiltered = 0;
         nodesChanged = false;
         processingFilter = true;
-        it = nodes.begin();
     }
 
-    for (int i = 0; i < 10 && it != nodes.end(); i++) {
-        applyNodesFilter(it->first, true);
-        it++;
+    int processed = 0;
+    while (idx < nodeOrder.size() && processed < 10) {
+        applyNodesFilter(nodeOrder[idx], true);
+        idx++;
+        processed++;
     }
 
-    if (it == nodes.end()) {
+    if (idx >= nodeOrder.size()) {
         processingFilter = false;
     }
     updateNodesStatus();
