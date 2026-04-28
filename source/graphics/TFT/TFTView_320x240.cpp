@@ -4789,19 +4789,30 @@ void TFTView_320x240::addNode(uint32_t nodeNum, uint8_t ch, const char *userShor
     lv_obj_add_event_cb(nodeButton, ui_event_NodeButton, LV_EVENT_ALL, (void *)nodeNum);
 
     // move node into new position within nodePanel
-    if (lastHeard) {
+    // Skip if virtualization is active — refreshVirtualNodes() owns ordering and the
+    // panel's children include spacer objects that have no node sub-children, so the
+    // children walk below would dereference a non-existent index.
+    if (lastHeard && !nodesSpacerTop && !nodesSpacerBottom) {
         lv_obj_t **children = objects.nodes_panel->spec_attr->children;
         int i = objects.nodes_panel->spec_attr->child_cnt - 1;
         while (i > 1) {
-            if (lastHeard <= (time_t)(children[i - 1]->LV_OBJ_IDX(node_lh_idx)->user_data))
+            lv_obj_t *prev = children[i - 1];
+            if (!prev || !prev->spec_attr || prev->spec_attr->child_cnt <= node_lh_idx) {
+                i--;
+                continue;
+            }
+            if (lastHeard <= (time_t)(prev->LV_OBJ_IDX(node_lh_idx)->user_data))
                 break;
             i--;
         }
         if (i >= 1 && i < objects.nodes_panel->spec_attr->child_cnt - 1) {
-            lv_obj_move_to_index(p, i);
-            // re-arrange the group linked list by moving the new button (now at the tail) into the right position
-            void *after = children[i + 1]->LV_OBJ_IDX(node_btn_idx)->user_data;
-            _lv_ll_move_before(lv_group_ll, nodeButton->user_data, after);
+            lv_obj_t *next = children[i + 1];
+            if (next && next->spec_attr && next->spec_attr->child_cnt > node_btn_idx) {
+                lv_obj_move_to_index(p, i);
+                // re-arrange the group linked list by moving the new button (now at the tail) into the right position
+                void *after = next->LV_OBJ_IDX(node_btn_idx)->user_data;
+                _lv_ll_move_before(lv_group_ll, nodeButton->user_data, after);
+            }
         }
     }
 
@@ -5390,13 +5401,17 @@ void TFTView_320x240::handleResponse(uint32_t from, const uint32_t id, const mes
             if (req.type == ResponseHandler::TextMessageRequest) {
                 handleTextMessageResponse((unsigned long)req.cookie, id, ack, true);
                 // we probably have a wrong key; mark it as bad and don't use in future
-                if ((unsigned long)nodes[from]->LV_OBJ_IDX(node_bat_idx)->user_data == 1) {
-                    ILOG_DEBUG("public key mismatch");
-                    nodes[from]->LV_OBJ_IDX(node_bat_idx)->user_data = (void *)2;
-                    lv_obj_set_style_border_color(nodes[from]->LV_OBJ_IDX(node_img_idx), colorRed,
-                                                  LV_PART_MAIN | LV_STATE_DEFAULT);
-                    lv_obj_set_style_bg_image_src(objects.top_messages_node_image, &img_lock_slash_image,
-                                                  LV_PART_MAIN | LV_STATE_DEFAULT);
+                auto itFrom = nodes.find(from);
+                if (itFrom != nodes.end() && itFrom->second && itFrom->second->spec_attr &&
+                    itFrom->second->spec_attr->child_cnt > node_bat_idx) {
+                    if ((unsigned long)itFrom->second->LV_OBJ_IDX(node_bat_idx)->user_data == 1) {
+                        ILOG_DEBUG("public key mismatch");
+                        itFrom->second->LV_OBJ_IDX(node_bat_idx)->user_data = (void *)2;
+                        lv_obj_set_style_border_color(itFrom->second->LV_OBJ_IDX(node_img_idx), colorRed,
+                                                      LV_PART_MAIN | LV_STATE_DEFAULT);
+                        lv_obj_set_style_bg_image_src(objects.top_messages_node_image, &img_lock_slash_image,
+                                                      LV_PART_MAIN | LV_STATE_DEFAULT);
+                    }
                 }
             }
         } else {
@@ -5577,6 +5592,14 @@ void TFTView_320x240::purgeNode(uint32_t nodeNum)
 
     lv_obj_t **children = objects.nodes_panel->spec_attr->children;
     int last = objects.nodes_panel->spec_attr->child_cnt - 1;
+    auto isNodePanel = [&](lv_obj_t *c) {
+        return c && c != nodesSpacerTop && c != nodesSpacerBottom && c->spec_attr && c->spec_attr->child_cnt > node_tm2_idx;
+    };
+    // walk back to the last real node panel
+    while (last >= 0 && !isNodePanel(children[last]))
+        last--;
+    if (last < 0)
+        return;
     int i = last;
 
 #ifndef ALWAYS_PURGE_OLDEST_NODE
@@ -5587,18 +5610,28 @@ void TFTView_320x240::purgeNode(uint32_t nodeNum)
     curr_time = actTime;
 #endif
     // prefer purging older unknown nodes first (but not the brand new ones)
-    while ((eRole)(long)(children[i]->LV_OBJ_IDX(node_img_idx)->user_data) != eRole::unknown ||
-           curr_time < (time_t)(children[i]->LV_OBJ_IDX(node_lh_idx)->user_data) + 120 ||
-           (unsigned long)(children[i]->LV_OBJ_IDX(node_lbl_idx)->user_data) == nodeNum ||
-           chats.find((unsigned long)(children[i]->LV_OBJ_IDX(node_lbl_idx)->user_data)) != chats.end()) {
+    while (isNodePanel(children[i]) &&
+           ((eRole)(long)(children[i]->LV_OBJ_IDX(node_img_idx)->user_data) != eRole::unknown ||
+            curr_time < (time_t)(children[i]->LV_OBJ_IDX(node_lh_idx)->user_data) + 120 ||
+            (unsigned long)(children[i]->LV_OBJ_IDX(node_lbl_idx)->user_data) == nodeNum ||
+            chats.find((unsigned long)(children[i]->LV_OBJ_IDX(node_lbl_idx)->user_data)) != chats.end())) {
         if (i < (last + 1) / 5) { // keep 80% named nodes and 20% unknown (not fresh) nodes
             i = last;
             break;
         }
         i--;
+        if (i < 0) {
+            i = last;
+            break;
+        }
     }
+    // if we landed on a non-node child (e.g. spacer), fall back to the last real node
+    if (!isNodePanel(children[i]))
+        i = last;
 #endif
     lv_obj_t *p = children[i];
+    if (!isNodePanel(p))
+        return;
     uint32_t oldest = (unsigned long)(p->LV_OBJ_IDX(node_lbl_idx)->user_data);
     uint32_t lastHeard = (unsigned long)p->LV_OBJ_IDX(node_lh_idx)->user_data;
     if (lastHeard > 0 && (curtime - lastHeard <= secs_until_offline))
@@ -5906,8 +5939,14 @@ void TFTView_320x240::refreshVirtualNodes(bool force)
     // If forcing, drop all existing materialized node panels
     if (force) {
         for (auto &kv : nodes) {
-            if (kv.second)
+            if (kv.second) {
+                // avoid dangling pointers in expanded-panel state
+                if (kv.second == currentPanel) {
+                    currentPanel = nullptr;
+                    currentNode = 0;
+                }
                 lv_obj_delete(kv.second);
+            }
         }
         nodes.clear();
         nodeCount = 0;
@@ -5922,7 +5961,12 @@ void TFTView_320x240::refreshVirtualNodes(bool force)
     // Delete panels that are not needed
     for (auto it = nodes.begin(); it != nodes.end();) {
         if (needed.find(it->first) == needed.end()) {
-            lv_obj_delete(it->second);
+            if (it->second == currentPanel) {
+                currentPanel = nullptr;
+                currentNode = 0;
+            }
+            if (it->second)
+                lv_obj_delete(it->second);
             it = nodes.erase(it);
             if (nodeCount > 0)
                 nodeCount--;
@@ -6709,15 +6753,28 @@ void TFTView_320x240::newMessage(uint32_t from, uint32_t to, uint8_t ch, const c
     char buf[284]; // 237 + 4 + 40 + 2 + 1
     lv_obj_t *container = nullptr;
     if (to == UINT32_MAX) { // message for group, prepend short name to msg
-        if (nodes.find(from) == nodes.end()) {
-            pos += sprintf(buf, "%04x ", from & 0xffff);
-        } else {
-            // original short name is held in userData, extract it and add msg
-            char *userData = (char *)&(nodes[from]->LV_OBJ_IDX(node_lbs_idx)->user_data);
-            while (pos < 4 && userData[pos] != 0) {
-                buf[pos] = userData[pos];
+        auto itNode = nodes.find(from);
+        const char *shortFromData = nullptr;
+        if (itNode != nodes.end() && itNode->second && itNode->second->spec_attr &&
+            itNode->second->spec_attr->child_cnt > node_lbs_idx) {
+            shortFromData = (const char *)&(itNode->second->LV_OBJ_IDX(node_lbs_idx)->user_data);
+        }
+        // fall back to the data model (works even when the panel is virtualized away)
+        std::string shortFromBuf;
+        if (!shortFromData || !shortFromData[0]) {
+            auto nd = nodeData.find(from);
+            if (nd != nodeData.end() && !nd->second.shortName.empty()) {
+                shortFromBuf = nd->second.shortName;
+                shortFromData = shortFromBuf.c_str();
+            }
+        }
+        if (shortFromData && shortFromData[0]) {
+            while (pos < 4 && shortFromData[pos] != 0) {
+                buf[pos] = shortFromData[pos];
                 pos++;
             }
+        } else {
+            pos += sprintf(buf, "%04x", from & 0xffff);
         }
         buf[pos++] = ' ';
         container = channelGroup[ch];
@@ -6743,7 +6800,25 @@ void TFTView_320x240::newMessage(uint32_t from, uint32_t to, uint8_t ch, const c
             updateUnreadMessages();
             if (activePanel != objects.messages_panel && db.uiConfig.alert_enabled &&
                 !db.channel[ch].settings.module_settings.is_muted) {
-                showMessagePopup(from, to, ch, lv_label_get_text(nodes[from]->LV_OBJ_IDX(node_lbl_idx)));
+                const char *longFromName = nullptr;
+                auto itNode = nodes.find(from);
+                if (itNode != nodes.end() && itNode->second && itNode->second->spec_attr &&
+                    itNode->second->spec_attr->child_cnt > node_lbl_idx) {
+                    longFromName = lv_label_get_text(itNode->second->LV_OBJ_IDX(node_lbl_idx));
+                }
+                std::string longFromBuf;
+                if (!longFromName || !longFromName[0]) {
+                    auto nd = nodeData.find(from);
+                    if (nd != nodeData.end() && !nd->second.longName.empty()) {
+                        longFromBuf = nd->second.longName;
+                    } else {
+                        char tmp[16];
+                        snprintf(tmp, sizeof(tmp), "%04x", from & 0xffff);
+                        longFromBuf = tmp;
+                    }
+                    longFromName = longFromBuf.c_str();
+                }
+                showMessagePopup(from, to, ch, longFromName);
             }
             lv_obj_add_flag(container, LV_OBJ_FLAG_HIDDEN);
         }
