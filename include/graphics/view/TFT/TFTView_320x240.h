@@ -3,6 +3,7 @@
 #include "graphics/common/MeshtasticView.h"
 #include "meshtastic/clientonly.pb.h"
 #include <set>
+#include <vector>
 
 class MapPanel;
 
@@ -221,6 +222,29 @@ class TFTView_320x240 : public MeshtasticView
     void enablePanel(lv_obj_t *panel);
     void disablePanel(lv_obj_t *panel);
     void setGroupFocus(lv_obj_t *panel);
+    static void navFocusActivePanel(void);          // InputDriver gesture-nav callback
+    static bool navScrollActiveContent(int8_t dir); // scroll page content when focus can't move
+
+    // keyboard backlight (e.g. T-Deck pin): 0 = auto (on while in use), 1 = always on, 2 = always off
+    void initKbBacklight(void);
+    void applyKbBacklight(bool force = false);
+    void setKbBacklightMode(uint8_t mode);
+    static void ui_event_kb_backlight_button(lv_event_t *e);
+    uint8_t kbBacklightMode = 0;
+    bool kbBacklightState = false;
+    lv_obj_t *kbBacklightLabel = nullptr;
+
+    // on-device wifi scanning (ESP32 builds)
+    void initWifiScanUI(void);
+    void pollWifiScan(void);
+    void closeWifiScanList(void);
+    static void ui_event_wifi_scan_button(lv_event_t *e);
+    static void ui_event_wifi_scan_select(lv_event_t *e);
+    lv_obj_t *wifiScanButton = nullptr;
+    lv_obj_t *wifiScanButtonLabel = nullptr;
+    lv_obj_t *wifiScanList = nullptr;
+    bool wifiScanRunning = false;
+    std::vector<std::string> wifiScanSSIDs;
     void setInputGroup(void);
     void setInputButtonLabel(void);
     void updateGroupChannel(uint8_t chId);
@@ -239,6 +263,9 @@ class TFTView_320x240 : public MeshtasticView
 
     // Virtualized nodes list (row recycling via spacers)
     void refreshVirtualNodes(bool force = false);
+    void buildNodeOrder(std::vector<uint32_t> &order);
+    bool ensureNodePanel(uint32_t nodeNum);
+    void populateNodePanel(uint32_t nodeNum);
 
     void removeSpinner(void);
     void packetDetected(const meshtastic_MeshPacket &p);
@@ -253,6 +280,10 @@ class TFTView_320x240 : public MeshtasticView
     uint16_t nodesVirtualBuffer = 5;  // extra rows above/below viewport
     lv_coord_t nodesRowHeight = 53;   // must match NodePanel height
     uint32_t nodesOrderVersion = 0;
+    std::vector<uint32_t> nodesLastWindow; // ids materialized by last refresh, in visual order
+    int nodesLastFirst = -1;               // wantFirst of last refresh (cheap-exit check)
+    int nodesLastTotal = -1;               // total node count of last refresh (cheap-exit check)
+    bool ownPanelVirtHidden = false;       // own node static panel hidden by virtualization
 
     // Debounce resort/refresh to reduce CPU churn.
     // (We still get "instant" feel by refreshing at a fast cadence.)

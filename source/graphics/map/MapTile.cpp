@@ -46,21 +46,25 @@ bool MapTile::load(lv_obj_t *p, int16_t posx, int16_t posy, const lv_image_dsc_t
     // use lvgl built-in img loader
     char fname[128];
     fname[0] = LV_FS_ARDUINO_SD_LETTER;
-    sprintf(&fname[1], ":%s/%s%d/%d/%d.%s", MapTileSettings::getPrefix(), MapTileSettings::getTileStyle(), zoomLevel, xTile,
-            yTile, MapTileSettings::getTileFormat());
-    ILOG_DEBUG("SD file: %s", fname);
-    lv_image_set_src(img, fname);
-    if (lv_image_get_src((lv_obj_t *)img)) {
-        result = true;
-    } else {
-        // Fallback: try the alternate prefix (/map <-> /maps) for compatibility
-        const char *fallbackPrefix = (std::strcmp(MapTileSettings::getPrefix(), "/map") == 0) ? "/maps" : "/map";
-        sprintf(&fname[1], ":%s/%s%d/%d/%d.%s", fallbackPrefix, MapTileSettings::getTileStyle(), zoomLevel, xTile, yTile,
-                MapTileSettings::getTileFormat());
-        ILOG_DEBUG("SD file fallback: %s", fname);
-        lv_image_set_src(img, fname);
-        if (lv_image_get_src((lv_obj_t *)img)) {
-            result = true;
+
+    // Mixed tile sets are supported: try the configured format first (bin by default),
+    // then the other one (png <-> bin), at the configured prefix and the alternate
+    // prefix (/maps <-> /map) for compatibility.
+    const char *fmtPrimary = MapTileSettings::getTileFormat();
+    const char *fmtAlt = (std::strcmp(fmtPrimary, "bin") == 0) ? "png" : "bin";
+    const char *prefixPrimary = MapTileSettings::getPrefix();
+    const char *prefixAlt = (std::strcmp(prefixPrimary, "/map") == 0) ? "/maps" : "/map";
+    const char *prefixes[2] = {prefixPrimary, prefixAlt};
+    const char *formats[2] = {fmtPrimary, fmtAlt};
+    for (int p = 0; p < 2 && !result; p++) {
+        for (int f = 0; f < 2 && !result; f++) {
+            sprintf(&fname[1], ":%s/%s%d/%d/%d.%s", prefixes[p], MapTileSettings::getTileStyle(), zoomLevel, xTile, yTile,
+                    formats[f]);
+            lv_image_set_src(img, fname);
+            if (lv_image_get_src((lv_obj_t *)img)) {
+                ILOG_DEBUG("SD tile: %s", fname);
+                result = true;
+            }
         }
     }
 #endif

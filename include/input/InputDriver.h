@@ -45,6 +45,17 @@ class InputDriver
 
     static lv_group_t *getInputGroup(void) { return inputGroup; }
 
+    // Gesture navigation between the menu column and the page content (e.g. T-Deck trackball):
+    // the view registers the menu container, the active menu button and a callback that
+    // focuses the active page's first widget. Drivers call navFocusContent()/navFocusMenu()
+    // on horizontal gestures and navBlockBoundary() to keep vertical focus moves inside
+    // the current region.
+    static void setNavRegions(lv_obj_t *menuContainer, lv_obj_t *activeMenuButton, void (*focusContentCb)(void),
+                              bool (*scrollContentCb)(int8_t dir) = nullptr);
+    static bool navFocusContent(void);        // true when focus was redirected into the page content
+    static bool navFocusMenu(void);           // true when focus was redirected to the menu
+    static bool navBlockBoundary(int8_t dir); // true when a focus prev/next would cross menu<->content
+
   protected:
     InputDriver(void) : keyboardDevice("none"), pointerDevice("none") {}
     static InputDriver *driver;
@@ -53,6 +64,10 @@ class InputDriver
     static lv_indev_t *encoder;
     static lv_indev_t *button;
     static lv_group_t *inputGroup;
+    static lv_obj_t *navMenuContainer;
+    static lv_obj_t *navMenuButton;
+    static void (*navFocusContentCb)(void);
+    static bool (*navScrollContentCb)(int8_t dir);
 
     // used for linux hot plugging and unplugging
     std::string keyboardDevice; // current keyboard device string in use

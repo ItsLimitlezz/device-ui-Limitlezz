@@ -14,6 +14,11 @@
 #include "input/InputDriver.h"
 #include "lv_i18n.h"
 #include "lvgl_private.h"
+
+#if defined(ARCH_ESP32)
+#include <WiFi.h>
+#include <Wire.h>
+#endif
 #include "styles.h"
 #include "ui.h"
 #include "util/FileLoader.h"
@@ -26,6 +31,7 @@
 #include <list>
 #include <locale>
 #include <random>
+#include <set>
 #include <sstream>
 #include <time.h>
 #include <vector>
@@ -275,8 +281,21 @@ bool TFTView_320x240::setupUIConfig(const meshtastic_DeviceUIConfig &uiconfig)
     lv_textarea_set_text(objects.nodes_hl_name_area, highlight.node_name);
 
     // initialize own node panel
-    if (ownNode && objects.node_panel)
+    if (ownNode && objects.node_panel) {
         nodes[ownNode] = objects.node_panel;
+    } else if (objects.node_panel) {
+        // ownNode not known yet: keep the static panel hidden until setMyInfo() registers it,
+        // so it can't linger as an unmanaged row at the bottom of the list
+        lv_obj_add_flag(objects.node_panel, LV_OBJ_FLAG_HIDDEN);
+        ownPanelVirtHidden = true;
+    }
+
+    // activate nodes-list virtualization right away, so the initial nodeDB sync
+    // doesn't materialize a panel for every node in the mesh
+    refreshVirtualNodes(false);
+
+    // keyboard backlight control (T-Deck)
+    initKbBacklight();
 
     // touch screen calibration data
     uint16_t *parameters = (uint16_t *)db.uiConfig.calibration_data.bytes;
@@ -503,9 +522,19 @@ void TFTView_320x240::ui_set_active(lv_obj_t *b, lv_obj_t *p, lv_obj_t *tp)
     activePanel = p;
     if (activePanel == objects.messages_panel) {
         lv_group_focus_obj(objects.message_input_area);
+        // open the chat scrolled to the newest message (bottom of the history)
+        if (activeMsgContainer) {
+            lv_obj_update_layout(activeMsgContainer);
+            uint32_t n = lv_obj_get_child_count(activeMsgContainer);
+            if (n > 0)
+                lv_obj_scroll_to_view(lv_obj_get_child(activeMsgContainer, n - 1), LV_ANIM_OFF);
+        }
     } else if (inputdriver->hasKeyboardDevice() || inputdriver->hasEncoderDevice()) {
         setGroupFocus(activePanel);
     }
+
+    // register gesture-navigation regions: trackball left/right switches menu <-> page
+    InputDriver::setNavRegions(objects.button_panel, b, navFocusActivePanel, navScrollActiveContent);
 
     lv_obj_add_flag(objects.keyboard, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(objects.msg_popup_panel, LV_OBJ_FLAG_HIDDEN);
@@ -1005,10 +1034,11 @@ void TFTView_320x240::ui_event_NodesButton(lv_event_t *e)
             return;
         }
         THIS->ui_set_active(objects.nodes_button, objects.nodes_panel, objects.top_nodes_panel);
+        THIS->refreshVirtualNodes(false); // materialize the visible window right away
         if (filterNeedsUpdate) {
             THIS->updateNodesFiltered(true);
             THIS->updateNodesStatus();
-            lv_obj_scroll_to_view(objects.node_panel, LV_ANIM_ON);
+            lv_obj_scroll_to_y(objects.nodes_panel, 0, LV_ANIM_ON);
             if (THIS->map) {
                 THIS->map->forceRedraw(true);
             }
@@ -1030,11 +1060,16 @@ void TFTView_320x240::ui_event_NodeButton(lv_event_t *e)
         uint32_t nodeNum = (unsigned long)e->user_data;
         if (!nodeNum) // event-handler for own node has value 0 in user_data
             nodeNum = THIS->ownNode;
-        lv_obj_t *panel = THIS->nodes[nodeNum];
+        auto itPanel = THIS->nodes.find(nodeNum);
+        if (itPanel == THIS->nodes.end() || !itPanel->second)
+            return;
+        lv_obj_t *panel = itPanel->second;
 
-        // Check if click was in the image area (left ~40px) to open chat
+        // Check if click was in the image area (left ~40px) to open chat.
+        // Only meaningful for touch input — a trackball/keypad click has no x/y point,
+        // so for those the click always expands the node (the default below).
         lv_indev_t *indev = lv_indev_active();
-        if (indev && nodeNum != THIS->ownNode) {
+        if (indev && lv_indev_get_type(indev) == LV_INDEV_TYPE_POINTER && nodeNum != THIS->ownNode) {
             lv_point_t point;
             lv_indev_get_point(indev, &point);
             lv_area_t coords;
@@ -1239,9 +1274,13 @@ void TFTView_320x240::ui_event_ChatButton(lv_event_t *e)
             return; // treat as scroll, not click
         }
 
+        // The gutter/scroll guards below are touch-specific: a trackball/keypad click has no
+        // meaningful x/y point, so only apply them for pointer (touch) input.
+        bool isPointer = indev && lv_indev_get_type(indev) == LV_INDEV_TYPE_POINTER;
+
         // Only treat as a click when the touch is inside the label bounds (avoid blank gutter clicks)
         lv_obj_t *label = target->LV_OBJ_IDX(0); // chats_button_label
-        if (indev && label) {
+        if (isPointer && label) {
             lv_point_t pt;
             lv_indev_get_point(indev, &pt);
             lv_area_t la;
@@ -1803,6 +1842,8 @@ void TFTView_320x240::ui_event_wifi_button(lv_event_t *e)
         lv_textarea_set_text(objects.settings_wifi_ssid_textarea, THIS->db.config.network.wifi_ssid);
         lv_textarea_set_text(objects.settings_wifi_password_textarea, THIS->db.config.network.wifi_psk);
         lv_obj_clear_flag(objects.settings_wifi_panel, LV_OBJ_FLAG_HIDDEN);
+        THIS->closeWifiScanList();
+        THIS->initWifiScanUI();
         lv_group_focus_obj(objects.settings_wifi_ssid_textarea);
         THIS->disablePanel(objects.controller_panel);
         THIS->disablePanel(objects.tab_page_basic_settings);
@@ -2382,20 +2423,21 @@ void TFTView_320x240::ui_event_mapNodeButton(lv_event_t *e)
     // navigate to node in node list
     uint32_t nodeNum = (unsigned long)e->user_data;
     ILOG_DEBUG("map node %08x", nodeNum);
-    lv_obj_t *panel = THIS->nodes[nodeNum];
     THIS->ui_set_active(objects.nodes_button, objects.nodes_panel, objects.top_nodes_panel);
-    lv_obj_scroll_to_view(panel, LV_ANIM_ON);
-    if (panel != currentPanel)
-        ui_event_NodeButton(e);
+    if (THIS->ensureNodePanel(nodeNum)) {
+        lv_obj_t *panel = THIS->nodes[nodeNum];
+        lv_obj_scroll_to_view(panel, LV_ANIM_ON);
+        if (panel != currentPanel)
+            ui_event_NodeButton(e);
+    }
 }
 
 void TFTView_320x240::ui_event_chatNodeButton(lv_event_t *e)
 {
     uint32_t nodeNum = (unsigned long)e->user_data;
-    auto it = THIS->nodes.find(nodeNum);
-    if (it != THIS->nodes.end()) {
-        lv_obj_t *panel = it->second;
-        THIS->ui_set_active(objects.nodes_button, objects.nodes_panel, objects.top_nodes_panel);
+    THIS->ui_set_active(objects.nodes_button, objects.nodes_panel, objects.top_nodes_panel);
+    if (THIS->ensureNodePanel(nodeNum)) {
+        lv_obj_t *panel = THIS->nodes[nodeNum];
         lv_obj_scroll_to_view(panel, LV_ANIM_ON);
         if (panel != currentPanel)
             ui_event_NodeButton(e);
@@ -2445,7 +2487,13 @@ void TFTView_320x240::ui_event_nodesPanelScroll(lv_event_t *e)
 
     // Keep the virtual list window aligned with current scroll position.
     // This deletes LVGL node panels outside the viewport buffer and recreates only what's needed.
-    self->refreshVirtualNodes(false);
+    // Throttled: scroll events arrive every frame while dragging.
+    static uint32_t lastVirtRefreshMs = 0;
+    uint32_t nowMs = millis();
+    if (nowMs - lastVirtRefreshMs >= 60) {
+        lastVirtRefreshMs = nowMs;
+        self->refreshVirtualNodes(false);
+    }
 
     scroll_running = false;
 }
@@ -2574,6 +2622,9 @@ void TFTView_320x240::ui_event_navHome(lv_event_t *e)
     }
 }
 
+// xtensa gcc 8.4 ICEs on this function at -O2 (postreload SF-reg move); compile it at -Os
+#pragma GCC push_options
+#pragma GCC optimize("Os")
 void TFTView_320x240::loadMap(void)
 {
     if (!map) {
@@ -2719,10 +2770,13 @@ void TFTView_320x240::loadMap(void)
     lv_obj_clear_flag(objects.map_panel, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(objects.raw_map_panel, LV_OBJ_FLAG_HIDDEN);
 }
+#pragma GCC pop_options
 
 void TFTView_320x240::updateLocationMap(uint32_t num)
 {
-    lv_label_set_text_fmt(objects.top_map_label, _("Locations Map (%d/%d)"), num, nodeCount);
+    // nodeCount only counts materialized panels; the data model holds all nodes
+    int total = std::max((int)nodeCount, (int)nodeData.size());
+    lv_label_set_text_fmt(objects.top_map_label, _("Locations Map (%d/%d)"), num, total);
 }
 
 /**
@@ -2761,12 +2815,19 @@ void TFTView_320x240::addOrUpdateMap(uint32_t nodeNum, int32_t lat, int32_t lon)
         lv_obj_set_style_align(lbl, LV_ALIGN_BOTTOM_MID, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_align(lbl, LV_ALIGN_BOTTOM_MID, LV_PART_MAIN | LV_STATE_DEFAULT);
 
-        lv_obj_t *p = nodes[nodeNum];
-        lv_label_set_text_fmt(lbl, "%s", lv_label_get_text(p->LV_OBJ_IDX(node_lbs_idx)));
+        auto itPanel = nodes.find(nodeNum);
+        lv_obj_t *p = (itPanel != nodes.end()) ? itPanel->second : nullptr;
+        if (p && p->spec_attr && p->spec_attr->child_cnt > node_pos1_idx) {
+            lv_label_set_text_fmt(lbl, "%s", lv_label_get_text(p->LV_OBJ_IDX(node_lbs_idx)));
 
-        // position label callback
-        lv_obj_add_flag(p->LV_OBJ_IDX(node_pos1_idx), LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(p->LV_OBJ_IDX(node_pos1_idx), ui_event_positionButton, LV_EVENT_CLICKED, (void *)p);
+            // position label callback
+            lv_obj_add_flag(p->LV_OBJ_IDX(node_pos1_idx), LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(p->LV_OBJ_IDX(node_pos1_idx), ui_event_positionButton, LV_EVENT_CLICKED, (void *)p);
+        } else if (!rec.shortName.empty()) {
+            lv_label_set_text_fmt(lbl, "%s", rec.shortName.c_str());
+        } else {
+            lv_label_set_text_fmt(lbl, "%04x", (unsigned)(nodeNum & 0xffff));
+        }
 
         nodeObjects[nodeNum] = img;
         if (map) {
@@ -3057,16 +3118,32 @@ void TFTView_320x240::packetDetected(const meshtastic_MeshPacket &p)
             lv_obj_add_flag(objects.detector_radar_panel, LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(objects.detector_heard_label, LV_OBJ_FLAG_HIDDEN);
 
-            setNodeImage(p.from, (MeshtasticView::eRole)(unsigned long)nodes[p.from]->LV_OBJ_IDX(node_img_idx)->user_data, false,
-                         objects.detector_contact_image);
-            const char *lbl = lv_label_get_text(nodes[p.from]->LV_OBJ_IDX(node_lbl_idx));
-
+            // panel may be virtualized away; fall back to the node data model
+            auto itFrom = nodes.find(p.from);
+            auto ndFrom = nodeData.find(p.from);
+            const char *lbl = "";
             char from[5];
-            char *userShort = (char *)&(nodes[p.from]->LV_OBJ_IDX(node_lbs_idx)->user_data);
             int pos = 0;
-            while (pos < 4 && userShort[pos] != 0) {
-                from[pos] = userShort[pos];
-                pos++;
+            if (itFrom != nodes.end() && itFrom->second && itFrom->second->spec_attr &&
+                itFrom->second->spec_attr->child_cnt > node_lbs_idx) {
+                setNodeImage(p.from, (MeshtasticView::eRole)(unsigned long)itFrom->second->LV_OBJ_IDX(node_img_idx)->user_data,
+                             false, objects.detector_contact_image);
+                lbl = lv_label_get_text(itFrom->second->LV_OBJ_IDX(node_lbl_idx));
+                char *userShort = (char *)&(itFrom->second->LV_OBJ_IDX(node_lbs_idx)->user_data);
+                while (pos < 4 && userShort[pos] != 0) {
+                    from[pos] = userShort[pos];
+                    pos++;
+                }
+            } else if (ndFrom != nodeData.end()) {
+                setNodeImage(p.from, ndFrom->second.role, ndFrom->second.isUnmessagable, objects.detector_contact_image);
+                lbl = ndFrom->second.longName.c_str();
+                const std::string &sn = ndFrom->second.shortName;
+                while (pos < 4 && pos < (int)sn.size()) {
+                    from[pos] = sn[pos];
+                    pos++;
+                }
+            } else {
+                setNodeImage(p.from, eRole::unknown, false, objects.detector_contact_image);
             }
             from[pos] = '\0';
 
@@ -3112,13 +3189,26 @@ void TFTView_320x240::writePacketLog(const meshtastic_MeshPacket &p)
         strcpy(timebuf, "??:??:??");
     }
 
-    // get node name from
+    // get node name from (panel may be virtualized away; fall back to the data model)
     char from[5];
-    char *userShort = (char *)&(nodes[p.from]->LV_OBJ_IDX(node_lbs_idx)->user_data);
     int pos = 0;
-    while (pos < 4 && userShort[pos] != 0) {
-        from[pos] = userShort[pos];
-        pos++;
+    auto itFrom = nodes.find(p.from);
+    if (itFrom != nodes.end() && itFrom->second && itFrom->second->spec_attr &&
+        itFrom->second->spec_attr->child_cnt > node_lbs_idx) {
+        char *userShort = (char *)&(itFrom->second->LV_OBJ_IDX(node_lbs_idx)->user_data);
+        while (pos < 4 && userShort[pos] != 0) {
+            from[pos] = userShort[pos];
+            pos++;
+        }
+    } else {
+        auto nd = nodeData.find(p.from);
+        if (nd != nodeData.end()) {
+            const std::string &sn = nd->second.shortName;
+            while (pos < 4 && pos < (int)sn.size()) {
+                from[pos] = sn[pos];
+                pos++;
+            }
+        }
     }
     from[pos] = '\0';
 
@@ -4037,6 +4127,7 @@ void TFTView_320x240::ui_event_ok(lv_event_t *e)
                 THIS->controller->sendConfig(meshtastic_Config_NetworkConfig{THIS->db.config.network}, THIS->ownNode);
                 THIS->notifyReboot(true);
             }
+            THIS->closeWifiScanList();
             THIS->enablePanel(objects.home_panel);
             lv_obj_add_flag(objects.settings_wifi_panel, LV_OBJ_FLAG_HIDDEN);
             lv_group_focus_obj(objects.basic_settings_wifi_button);
@@ -4323,6 +4414,7 @@ void TFTView_320x240::ui_event_cancel(lv_event_t *e)
             break;
         }
         case TFTView_320x240::eWifi: {
+            THIS->closeWifiScanList();
             lv_obj_add_flag(objects.settings_wifi_panel, LV_OBJ_FLAG_HIDDEN);
             THIS->enablePanel(objects.home_panel);
             lv_group_focus_obj(objects.home_wlan_button);
@@ -4515,12 +4607,24 @@ void TFTView_320x240::handleAddMessage(char *msg)
         ch = (uint8_t)channelOrNode;
         requestId = requests.addRequest(ch, ResponseHandler::TextMessageRequest, (void *)(long)ch, callback);
     } else {
-        ch = (uint8_t)(unsigned long)nodes[channelOrNode]->user_data;
         to = channelOrNode;
-        usePkc = (unsigned long)nodes[to]->LV_OBJ_IDX(node_bat_idx)->user_data; // hasKey
+        int8_t hopsAway = -1;
+        auto itTo = nodes.find(to);
+        if (itTo != nodes.end() && itTo->second && itTo->second->spec_attr && itTo->second->spec_attr->child_cnt > node_sig_idx) {
+            ch = (uint8_t)(unsigned long)itTo->second->user_data;
+            usePkc = (unsigned long)itTo->second->LV_OBJ_IDX(node_bat_idx)->user_data; // hasKey
+            hopsAway = (int8_t)(signed long)itTo->second->LV_OBJ_IDX(node_sig_idx)->user_data;
+        } else {
+            // panel is virtualized away; use the node data model
+            auto nd = nodeData.find(to);
+            if (nd != nodeData.end()) {
+                ch = nd->second.channel;
+                usePkc = nd->second.hasKey;
+                hopsAway = nd->second.hopsAway;
+            }
+        }
         requestId = requests.addRequest(to, ResponseHandler::TextMessageRequest, (void *)to, callback);
         // trial: hoplimit optimization for direct text messages
-        int8_t hopsAway = (signed long)nodes[to]->LV_OBJ_IDX(node_sig_idx)->user_data;
         if (hopsAway < 0)
             hopsAway = db.config.lora.hop_limit;
         hopLimit = (hopsAway < db.config.lora.hop_limit ? hopsAway + 1 : hopsAway);
@@ -4725,7 +4829,9 @@ void TFTView_320x240::addNode(uint32_t nodeNum, uint8_t ch, const char *userShor
         char buf[20];
         bool isOnline = lastHeardToString(lastHeard, buf);
         lv_label_set_text(ui_lastHeardLabel, buf);
-        if (isOnline) {
+        // with virtualization active this is just re-materialization of a known node;
+        // counting it here would inflate nodesOnline on every scroll/resort
+        if (isOnline && !(nodesSpacerTop && nodesSpacerBottom)) {
             nodesOnline++;
         }
     } else {
@@ -4825,6 +4931,22 @@ void TFTView_320x240::addNode(uint32_t nodeNum, uint8_t ch, const char *userShor
 void TFTView_320x240::setMyInfo(uint32_t nodeNum)
 {
     ownNode = nodeNum;
+    // make sure the static own-node panel is registered (setupUIConfig may have run before ownNode was known)
+    if (screensInitialised && objects.node_panel) {
+        // if a dynamic panel was created for our own node before ownNode was known,
+        // drop it — otherwise our own device shows up twice in the list
+        auto it = nodes.find(ownNode);
+        if (it != nodes.end() && it->second && it->second != objects.node_panel) {
+            if (it->second == currentPanel) {
+                currentPanel = nullptr;
+                currentNode = 0;
+            }
+            lv_obj_delete(it->second);
+            if (nodeCount > 0)
+                nodeCount--;
+        }
+        nodes[ownNode] = objects.node_panel;
+    }
 }
 
 void TFTView_320x240::setDeviceMetaData(int hw_model, const char *version, bool has_bluetooth, bool has_wifi, bool has_eth,
@@ -4835,6 +4957,7 @@ void TFTView_320x240::setDeviceMetaData(int hw_model, const char *version, bool 
 void TFTView_320x240::addOrUpdateNode(uint32_t nodeNum, uint8_t channel, uint32_t lastHeard, const meshtastic_User &cfg)
 {
     // keep source-of-truth in nodeData
+    bool isNewRecord = nodeData.find(nodeNum) == nodeData.end();
     auto &rec = getOrCreateNodeRecord(nodeNum);
     rec.id = nodeNum;
     rec.channel = channel;
@@ -4847,8 +4970,16 @@ void TFTView_320x240::addOrUpdateNode(uint32_t nodeNum, uint8_t channel, uint32_
     rec.hasUser = true;
 
     if (nodes.find(nodeNum) == nodes.end()) {
-        addNode(nodeNum, channel, cfg.short_name, cfg.long_name, lastHeard, (MeshtasticView::eRole)cfg.role,
-                cfg.public_key.size != 0, cfg.has_is_unmessagable && cfg.is_unmessagable);
+        // With virtualization active, panels are materialized on demand by refreshVirtualNodes();
+        // creating one here for every node in the DB would defeat the windowing.
+        if (!(nodesSpacerTop && nodesSpacerBottom)) {
+            addNode(nodeNum, channel, cfg.short_name, cfg.long_name, lastHeard, (MeshtasticView::eRole)cfg.role,
+                    cfg.public_key.size != 0, cfg.has_is_unmessagable && cfg.is_unmessagable);
+        } else if (isNewRecord && lastHeard && curtime - (time_t)lastHeard <= (time_t)secs_until_offline) {
+            // addNode() won't run for this freshly discovered node; count it once here
+            // (updateAllLastHeard() recounts from nodeData every 60s either way)
+            nodesOnline++;
+        }
     } else {
         updateNode(nodeNum, channel, cfg);
     }
@@ -5015,19 +5146,25 @@ void TFTView_320x240::updatePosition(uint32_t nodeNum, int32_t lat, int32_t lon,
     }
 
     if (lat != 0 && lon != 0) {
-        char buf[32];
-        sprintf(buf, "%.5f %.5f", lat * 1e-7, lon * 1e-7);
-        lv_obj_t *panel = nodes[nodeNum];
-        lv_label_set_text(panel->LV_OBJ_IDX(node_pos1_idx), buf);
-        if (sats)
-            sprintf(buf, "%d%s MSL  %u sats", altU, units, sats);
-        sprintf(buf, "%d%s MSL", altU, units);
-        lv_label_set_text(panel->LV_OBJ_IDX(node_pos2_idx), buf);
-        // no longer depend on lvgl user_data for source-of-truth
-        panel->LV_OBJ_IDX(node_pos1_idx)->user_data = (void *)lat;
-        panel->LV_OBJ_IDX(node_pos2_idx)->user_data = (void *)lon;
-        lv_obj_remove_flag(panel->LV_OBJ_IDX(node_pos1_idx), LV_OBJ_FLAG_HIDDEN);
-        lv_obj_remove_flag(panel->LV_OBJ_IDX(node_pos2_idx), LV_OBJ_FLAG_HIDDEN);
+        // panel may be virtualized away; the data was already persisted in nodeData above
+        auto itPanel = nodes.find(nodeNum);
+        if (itPanel != nodes.end() && itPanel->second && itPanel->second->spec_attr &&
+            itPanel->second->spec_attr->child_cnt > node_pos2_idx) {
+            lv_obj_t *panel = itPanel->second;
+            char buf[32];
+            sprintf(buf, "%.5f %.5f", lat * 1e-7, lon * 1e-7);
+            lv_label_set_text(panel->LV_OBJ_IDX(node_pos1_idx), buf);
+            if (sats)
+                sprintf(buf, "%d%s MSL  %u sats", altU, units, sats);
+            else
+                sprintf(buf, "%d%s MSL", altU, units);
+            lv_label_set_text(panel->LV_OBJ_IDX(node_pos2_idx), buf);
+            // no longer depend on lvgl user_data for source-of-truth
+            panel->LV_OBJ_IDX(node_pos1_idx)->user_data = (void *)lat;
+            panel->LV_OBJ_IDX(node_pos2_idx)->user_data = (void *)lon;
+            lv_obj_remove_flag(panel->LV_OBJ_IDX(node_pos1_idx), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(panel->LV_OBJ_IDX(node_pos2_idx), LV_OBJ_FLAG_HIDDEN);
+        }
     }
 
     applyNodesFilter(nodeNum);
@@ -5035,6 +5172,18 @@ void TFTView_320x240::updatePosition(uint32_t nodeNum, int32_t lat, int32_t lon,
 
 void TFTView_320x240::updateDistance(uint32_t nodeNum, int32_t lat, int32_t lon)
 {
+    // persist distance source coords in data map
+    auto &rec = getOrCreateNodeRecord(nodeNum);
+    rec.lat = lat;
+    rec.lon = lon;
+    rec.hasPosition = true;
+
+    // panel may be virtualized away; nothing to draw then
+    auto itPanel = nodes.find(nodeNum);
+    if (itPanel == nodes.end() || !itPanel->second || !itPanel->second->spec_attr ||
+        itPanel->second->spec_attr->child_cnt <= node_lbs_idx)
+        return;
+
     // if we know our position then calculate (simple) distance to other node in km
     float dx = 71.5 * 1e-7 * (myLongitude - lon);
     float dy = 111.3 * 1e-7 * (myLatitude - lat);
@@ -5042,7 +5191,7 @@ void TFTView_320x240::updateDistance(uint32_t nodeNum, int32_t lat, int32_t lon)
 
     // add distance to user short field
     char buf[32];
-    char *userData = (char *)&(nodes[nodeNum]->LV_OBJ_IDX(node_lbs_idx)->user_data);
+    char *userData = (char *)&(itPanel->second->LV_OBJ_IDX(node_lbs_idx)->user_data);
     buf[0] = userData[0];
     buf[1] = userData[1];
     buf[2] = userData[2];
@@ -5061,15 +5210,9 @@ void TFTView_320x240::updateDistance(uint32_t nodeNum, int32_t lat, int32_t lon)
             sprintf(&buf[5], "%d ft ", uint32_t(dist * 3280.84));
     }
     // we used the userShort label to add the distance, so re-arrange a bit the position
-    lv_obj_t *userShort = nodes[nodeNum]->LV_OBJ_IDX(node_lbs_idx);
+    lv_obj_t *userShort = itPanel->second->LV_OBJ_IDX(node_lbs_idx);
     lv_label_set_text(userShort, buf);
     lv_obj_set_pos(userShort, 30, -1);
-
-    // persist distance source coords in data map as well
-    auto &rec = getOrCreateNodeRecord(nodeNum);
-    rec.lat = lat;
-    rec.lon = lon;
-    rec.hasPosition = true;
 }
 
 /**
@@ -5090,7 +5233,7 @@ void TFTView_320x240::updateMetrics(uint32_t nodeNum, uint32_t bat_level, float 
     rec.airUtil = airUtil;
 
     auto it = nodes.find(nodeNum);
-    if (it != nodes.end()) {
+    if (it != nodes.end() && it->second) {
         char buf[48];
         if (it->first == ownNode) {
             sprintf(buf, _("Util %0.1f%%  Air %0.1f%%"), chUtil, airUtil);
@@ -5215,8 +5358,13 @@ void TFTView_320x240::updatePowerMetrics(uint32_t nodeNum, const meshtastic_Powe
 void TFTView_320x240::updateSignalStrength(uint32_t nodeNum, int32_t rssi, float snr)
 {
     if (nodeNum != ownNode) {
+        // mirror "heard directly" into the data model (don't create ghost records)
+        auto nd = nodeData.find(nodeNum);
+        if (nd != nodeData.end())
+            nd->second.hopsAway = 0;
+
         auto it = nodes.find(nodeNum);
-        if (it != nodes.end()) {
+        if (it != nodes.end() && it->second) {
             char buf[32];
             if (rssi == 0 && snr == 0.0) {
                 buf[0] = '\0';
@@ -5233,8 +5381,14 @@ void TFTView_320x240::updateSignalStrength(uint32_t nodeNum, int32_t rssi, float
 void TFTView_320x240::updateHopsAway(uint32_t nodeNum, uint8_t hopsAway)
 {
     if (nodeNum != ownNode) {
+        // mirror into the data model so filters and hop-limit optimization work for
+        // nodes whose panel is virtualized away (don't create ghost records)
+        auto nd = nodeData.find(nodeNum);
+        if (nd != nodeData.end())
+            nd->second.hopsAway = (int8_t)hopsAway;
+
         auto it = nodes.find(nodeNum);
-        if (it != nodes.end()) {
+        if (it != nodes.end() && it->second) {
             char buf[32];
             sprintf(buf, _("hops: %d"), (int)hopsAway);
             lv_label_set_text(it->second->LV_OBJ_IDX(node_sig_idx), buf);
@@ -5749,7 +5903,9 @@ bool TFTView_320x240::applyNodesFilter(uint32_t nodeNum, bool reset)
             lv_obj_add_flag(panel, LV_OBJ_FLAG_HIDDEN);
             nodesFiltered++;
         }
-    } else {
+    } else if (!(panel == objects.node_panel && ownPanelVirtHidden)) {
+        // never unhide the own-node static panel while the virtualizer has it hidden
+        // (it sits at an unmanaged index and would show up as a duplicate row)
         lv_obj_clear_flag(panel, LV_OBJ_FLAG_HIDDEN);
     }
 
@@ -5829,45 +5985,89 @@ bool TFTView_320x240::applyNodesFilter(uint32_t nodeNum, bool reset)
 
 void TFTView_320x240::rebuildNodesFromData()
 {
-    // create missing panels from data map; keep existing ones
-    for (auto &kv : nodeData) {
-        uint32_t nodeNum = kv.first;
-        NodeRecord &rec = kv.second;
-        if (nodes.find(nodeNum) != nodes.end())
-            continue;
-
-        // fallback defaults
-        const char *shortName = rec.shortName.empty() ? "" : rec.shortName.c_str();
-        const char *longName = rec.longName.empty() ? "" : rec.longName.c_str();
-        char shortBuf[8] = {};
-        char longBuf[32] = {};
-        if (!shortName[0]) {
-            sprintf(shortBuf, "%04x", nodeNum & 0xffff);
-            shortName = shortBuf;
-        }
-        if (!longName[0]) {
-            snprintf(longBuf, sizeof(longBuf), "Node %s", shortName);
-            longName = longBuf;
-        }
-
-        addNode(nodeNum, rec.channel, shortName, longName, rec.lastHeard, rec.role, rec.hasKey, rec.isUnmessagable);
-    }
+    // panels are materialized on demand from nodeData by refreshVirtualNodes()
+    refreshVirtualNodes(true);
     nodesChanged = true;
 }
 
 void TFTView_320x240::reorderNodesFromData()
 {
-    // Keep the data model up to date.
-    rebuildNodesFromData();
-
     // Bump version so the virtual list knows order changed.
     nodesOrderVersion++;
 
-    // If we're using virtualization, we don't keep one LVGL panel per node anymore.
-    // Just refresh visible rows.
+    // refreshVirtualNodes() compares the new window against the last one and
+    // only rebuilds when the visible order actually changed.
     refreshVirtualNodes(true);
 
     nodesChanged = true;
+}
+
+/**
+ * @brief Build the sorted node order for the virtual list (own node first, then by lastHeard)
+ */
+void TFTView_320x240::buildNodeOrder(std::vector<uint32_t> &order)
+{
+    order.clear();
+    order.reserve(nodeData.size());
+    for (auto &kv : nodeData) {
+        order.push_back(kv.first);
+    }
+    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+        if (a == ownNode && b != ownNode)
+            return true;
+        if (b == ownNode && a != ownNode)
+            return false;
+        const auto &ra = nodeData.at(a);
+        const auto &rb = nodeData.at(b);
+        if (ra.lastHeard != rb.lastHeard)
+            return ra.lastHeard > rb.lastHeard;
+        return a < b;
+    });
+}
+
+/**
+ * @brief Restore the extended labels (battery, hops, position) of a freshly recycled panel
+ *        from the node data model; addNode() only fills name/lastHeard/role.
+ */
+void TFTView_320x240::populateNodePanel(uint32_t nodeNum)
+{
+    auto nd = nodeData.find(nodeNum);
+    if (nd == nodeData.end())
+        return;
+    NodeRecord &rec = nd->second;
+    if (rec.batLevel != 0 || rec.voltage != 0.0f)
+        updateMetrics(nodeNum, rec.batLevel, rec.voltage, rec.chUtil, rec.airUtil);
+    if (rec.hopsAway > 0)
+        updateHopsAway(nodeNum, (uint8_t)rec.hopsAway);
+    if (rec.hasPosition)
+        updatePosition(nodeNum, rec.lat, rec.lon, rec.alt, rec.sats, rec.precision);
+}
+
+/**
+ * @brief Make sure a node panel is materialized (scrolls the virtual list to it if needed).
+ * @return true when the panel exists afterwards
+ */
+bool TFTView_320x240::ensureNodePanel(uint32_t nodeNum)
+{
+    auto it = nodes.find(nodeNum);
+    if (it != nodes.end() && it->second)
+        return true;
+    if (!objects.nodes_panel)
+        return false;
+
+    std::vector<uint32_t> order;
+    buildNodeOrder(order);
+    auto pos = std::find(order.begin(), order.end(), nodeNum);
+    if (pos == order.end())
+        return false;
+
+    lv_coord_t rowGap = lv_obj_get_style_pad_row(objects.nodes_panel, LV_PART_MAIN);
+    lv_coord_t rowPitch = nodesRowHeight + rowGap;
+    lv_obj_scroll_to_y(objects.nodes_panel, (lv_coord_t)((pos - order.begin()) * rowPitch), LV_ANIM_OFF);
+    refreshVirtualNodes(false);
+
+    it = nodes.find(nodeNum);
+    return it != nodes.end() && it->second;
 }
 
 /**
@@ -5903,27 +6103,17 @@ void TFTView_320x240::refreshVirtualNodes(bool force)
 
     // Build ordered list (instant last-heard sorting)
     std::vector<uint32_t> order;
-    order.reserve(nodeData.size());
-    for (auto &kv : nodeData) {
-        order.push_back(kv.first);
-    }
-    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
-        if (a == ownNode && b != ownNode)
-            return true;
-        if (b == ownNode && a != ownNode)
-            return false;
-        const auto &ra = nodeData.at(a);
-        const auto &rb = nodeData.at(b);
-        if (ra.lastHeard != rb.lastHeard)
-            return ra.lastHeard > rb.lastHeard;
-        return a < b;
-    });
+    buildNodeOrder(order);
+
+    // Row pitch is the panel height plus the flex row gap of the parent
+    lv_coord_t rowGap = lv_obj_get_style_pad_row(objects.nodes_panel, LV_PART_MAIN);
+    lv_coord_t rowPitch = nodesRowHeight + rowGap;
 
     // Determine viewport window
     lv_coord_t scroll_y = lv_obj_get_scroll_y(objects.nodes_panel);
     if (scroll_y < 0)
-        scroll_y = -scroll_y;
-    int firstVisible = (nodesRowHeight > 0) ? (scroll_y / nodesRowHeight) : 0;
+        scroll_y = 0;
+    int firstVisible = (rowPitch > 0) ? (scroll_y / rowPitch) : 0;
     int total = (int)order.size();
 
     int wantFirst = std::max(0, firstVisible - (int)nodesVirtualBuffer);
@@ -5931,45 +6121,93 @@ void TFTView_320x240::refreshVirtualNodes(bool force)
     if (wantLast < wantFirst)
         wantLast = wantFirst;
 
-    // Update spacer sizes to preserve full scroll height
-    lv_obj_set_height(nodesSpacerTop, wantFirst * nodesRowHeight);
-    int bottomCount = std::max(0, total - (wantLast + 1));
-    lv_obj_set_height(nodesSpacerBottom, bottomCount * nodesRowHeight);
+    // Window slice (node ids in visual order)
+    std::vector<uint32_t> windowSlice;
+    windowSlice.reserve(nodesVirtualWindow);
+    for (int i = wantFirst; i <= wantLast && i < total; i++) {
+        windowSlice.push_back(order[i]);
+    }
 
-    // If forcing, drop all existing materialized node panels
+    // Nothing changed at all: only freshen the visible lastHeard labels and skip
+    // all layout work (this runs on every scroll event and every 200ms tick)
+    if (!force && windowSlice == nodesLastWindow && wantFirst == nodesLastFirst && total == nodesLastTotal) {
+        for (uint32_t nodeNum : windowSlice) {
+            auto it = nodes.find(nodeNum);
+            auto nd = nodeData.find(nodeNum);
+            if (it == nodes.end() || !it->second || nd == nodeData.end())
+                continue;
+            if (!it->second->spec_attr || it->second->spec_attr->child_cnt <= node_lh_idx)
+                continue;
+            NodeRecord &rec = nd->second;
+            uint32_t currentLH = (unsigned long)it->second->LV_OBJ_IDX(node_lh_idx)->user_data;
+            if (rec.lastHeard != 0 && rec.lastHeard != currentLH) {
+                it->second->LV_OBJ_IDX(node_lh_idx)->user_data = (void *)(unsigned long)rec.lastHeard;
+                char buf[32];
+                lastHeardToString((time_t)rec.lastHeard, buf);
+                lv_label_set_text(it->second->LV_OBJ_IDX(node_lh_idx), buf);
+            }
+        }
+        return;
+    }
+
+    // Visible order unchanged: downgrade a forced rebuild to a cheap refresh
+    if (force && windowSlice == nodesLastWindow)
+        force = false;
+
+    // Update spacer sizes to preserve full scroll height
+    // (subtract one row gap: flex already inserts a gap next to the spacer)
+    int bottomCount = std::max(0, total - (wantLast + 1));
+    lv_obj_set_height(nodesSpacerTop, wantFirst > 0 ? wantFirst * rowPitch - rowGap : 0);
+    lv_obj_set_height(nodesSpacerBottom, bottomCount > 0 ? bottomCount * rowPitch - rowGap : 0);
+
+    // If forcing, drop all existing materialized node panels (recreating them in
+    // sorted order also keeps the input group focus order correct)
     if (force) {
-        for (auto &kv : nodes) {
-            if (kv.second) {
-                // avoid dangling pointers in expanded-panel state
-                if (kv.second == currentPanel) {
+        for (auto it = nodes.begin(); it != nodes.end();) {
+            lv_obj_t *p = it->second;
+            if (p == objects.node_panel) { // never delete the static own-node panel
+                ++it;
+                continue;
+            }
+            if (p) {
+                if (p == currentPanel) { // avoid dangling pointers in expanded-panel state
                     currentPanel = nullptr;
                     currentNode = 0;
                 }
-                lv_obj_delete(kv.second);
+                lv_obj_delete(p);
+                if (nodeCount > 0)
+                    nodeCount--;
             }
+            it = nodes.erase(it);
         }
-        nodes.clear();
-        nodeCount = 0;
     }
 
     // Materialize needed nodes, delete those outside window
-    std::set<uint32_t> needed;
-    for (int i = wantFirst; i <= wantLast && i < total; i++) {
-        needed.insert(order[i]);
-    }
+    std::set<uint32_t> needed(windowSlice.begin(), windowSlice.end());
 
     // Delete panels that are not needed
     for (auto it = nodes.begin(); it != nodes.end();) {
         if (needed.find(it->first) == needed.end()) {
-            if (it->second == currentPanel) {
-                currentPanel = nullptr;
-                currentNode = 0;
+            lv_obj_t *p = it->second;
+            if (p == objects.node_panel) {
+                // static own-node panel: hide it instead of deleting
+                if (!ownPanelVirtHidden) {
+                    lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN);
+                    ownPanelVirtHidden = true;
+                }
+                ++it;
+                continue;
             }
-            if (it->second)
-                lv_obj_delete(it->second);
+            if (p) {
+                if (p == currentPanel) {
+                    currentPanel = nullptr;
+                    currentNode = 0;
+                }
+                lv_obj_delete(p);
+                if (nodeCount > 0)
+                    nodeCount--;
+            }
             it = nodes.erase(it);
-            if (nodeCount > 0)
-                nodeCount--;
         } else {
             ++it;
         }
@@ -5981,52 +6219,73 @@ void TFTView_320x240::refreshVirtualNodes(bool force)
     lv_obj_move_to_index(nodesSpacerBottom, objects.nodes_panel->spec_attr->child_cnt - 1);
 
     int insertIdx = 1;
-    for (int i = wantFirst; i <= wantLast && i < total; i++) {
-        uint32_t nodeNum = order[i];
-        if (nodes.find(nodeNum) == nodes.end()) {
+    for (uint32_t nodeNum : windowSlice) {
+        auto it = nodes.find(nodeNum);
+        if (it != nodes.end() && !it->second) { // drop stale null entries
+            nodes.erase(it);
+            it = nodes.end();
+        }
+        if (it == nodes.end()) {
             auto nd = nodeData.find(nodeNum);
             if (nd == nodeData.end())
                 continue;
             NodeRecord &rec = nd->second;
 
-            // Fallbacks
-            const char *shortName = rec.shortName.empty() ? "" : rec.shortName.c_str();
-            const char *longName = rec.longName.empty() ? "" : rec.longName.c_str();
-            char shortBuf[8] = {};
-            char longBuf[32] = {};
-            if (!shortName[0]) {
-                sprintf(shortBuf, "%04x", nodeNum & 0xffff);
-                shortName = shortBuf;
-            }
-            if (!longName[0]) {
-                snprintf(longBuf, sizeof(longBuf), "Node %s", shortName);
-                longName = longBuf;
-            }
+            if (nodeNum == ownNode && objects.node_panel) {
+                // own node always uses the static panel; never create a dynamic duplicate
+                nodes[ownNode] = objects.node_panel;
+                it = nodes.find(nodeNum);
+            } else {
+                // Fallbacks
+                const char *shortName = rec.shortName.empty() ? "" : rec.shortName.c_str();
+                const char *longName = rec.longName.empty() ? "" : rec.longName.c_str();
+                char shortBuf[8] = {};
+                char longBuf[32] = {};
+                if (!shortName[0]) {
+                    sprintf(shortBuf, "%04x", nodeNum & 0xffff);
+                    shortName = shortBuf;
+                }
+                if (!longName[0]) {
+                    snprintf(longBuf, sizeof(longBuf), "Node %s", shortName);
+                    longName = longBuf;
+                }
 
-            addNode(nodeNum, rec.channel, shortName, longName, rec.lastHeard, rec.role, rec.hasKey, rec.isUnmessagable);
+                addNode(nodeNum, rec.channel, shortName, longName, rec.lastHeard, rec.role, rec.hasKey, rec.isUnmessagable);
+                populateNodePanel(nodeNum); // restore battery/hops/position labels
+                it = nodes.find(nodeNum);
+            }
+        }
+        if (it == nodes.end() || !it->second)
+            continue;
+
+        // un-hide the static own-node panel when it scrolls back into the window
+        if (it->second == objects.node_panel && ownPanelVirtHidden) {
+            lv_obj_remove_flag(it->second, LV_OBJ_FLAG_HIDDEN);
+            ownPanelVirtHidden = false;
         }
 
         // Place the node panel between spacers in sorted order
-        auto it = nodes.find(nodeNum);
-        if (it != nodes.end()) {
-            lv_obj_move_to_index(it->second, insertIdx);
+        lv_obj_move_to_index(it->second, insertIdx);
 
-            // Update only if changed (avoid LVGL churn)
-            auto nd = nodeData.find(nodeNum);
-            if (nd != nodeData.end()) {
-                NodeRecord &rec = nd->second;
-                uint32_t currentLH = (unsigned long)it->second->LV_OBJ_IDX(node_lh_idx)->user_data;
-                if (rec.lastHeard != 0 && rec.lastHeard != currentLH) {
-                    it->second->LV_OBJ_IDX(node_lh_idx)->user_data = (void *)(unsigned long)rec.lastHeard;
-                    char buf[32];
-                    lastHeardToString((time_t)rec.lastHeard, buf);
-                    lv_label_set_text(it->second->LV_OBJ_IDX(node_lh_idx), buf);
-                }
+        // Update only if changed (avoid LVGL churn)
+        auto nd = nodeData.find(nodeNum);
+        if (nd != nodeData.end() && it->second->spec_attr && it->second->spec_attr->child_cnt > node_lh_idx) {
+            NodeRecord &rec = nd->second;
+            uint32_t currentLH = (unsigned long)it->second->LV_OBJ_IDX(node_lh_idx)->user_data;
+            if (rec.lastHeard != 0 && rec.lastHeard != currentLH) {
+                it->second->LV_OBJ_IDX(node_lh_idx)->user_data = (void *)(unsigned long)rec.lastHeard;
+                char buf[32];
+                lastHeardToString((time_t)rec.lastHeard, buf);
+                lv_label_set_text(it->second->LV_OBJ_IDX(node_lh_idx), buf);
             }
-
-            insertIdx++;
         }
+
+        insertIdx++;
     }
+
+    nodesLastWindow = std::move(windowSlice);
+    nodesLastFirst = wantFirst;
+    nodesLastTotal = total;
 }
 
 void TFTView_320x240::messageAlert(const char *alert, bool show)
@@ -6982,9 +7241,13 @@ void TFTView_320x240::addChat(uint32_t from, uint32_t to, uint8_t ch)
         sprintf(buf, "%d: %s", (int)ch, lv_label_get_text(channel[ch]));
     } else {
         auto it = nodes.find(from);
-        if (it != nodes.end()) {
+        auto nd = nodeData.find(from);
+        if (it != nodes.end() && it->second) {
             sprintf(buf, "%s: %s", lv_label_get_text(it->second->LV_OBJ_IDX(node_lbs_idx)),
                     lv_label_get_text(it->second->LV_OBJ_IDX(node_lbl_idx)));
+        } else if (nd != nodeData.end() && !nd->second.shortName.empty()) {
+            // panel virtualized away; use the data model
+            snprintf(buf, sizeof(buf), "%s: %s", nd->second.shortName.c_str(), nd->second.longName.c_str());
         } else {
             sprintf(buf, "!%08x", from);
         }
@@ -7143,29 +7406,43 @@ void TFTView_320x240::showMessages(uint32_t nodeNum)
     }
     activeMsgContainer->user_data = (void *)nodeNum;
     lv_obj_clear_flag(activeMsgContainer, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_t *p = nodes[nodeNum];
-    if (p) {
-        lv_label_set_text(objects.top_messages_node_label, lv_label_get_text(p->LV_OBJ_IDX(node_lbl_idx)));
-        ui_set_active(objects.messages_button, objects.messages_panel, objects.top_messages_panel);
-        switch ((unsigned long)p->LV_OBJ_IDX(node_bat_idx)->user_data) {
-        case 0:
-            lv_obj_set_style_bg_image_src(objects.top_messages_node_image, &img_lock_channel_image,
-                                          LV_PART_MAIN | LV_STATE_DEFAULT);
-            break;
-        case 1:
-            lv_obj_set_style_bg_image_src(objects.top_messages_node_image, &img_lock_secure_image,
-                                          LV_PART_MAIN | LV_STATE_DEFAULT);
-            break;
-        default:
-            lv_obj_set_style_bg_image_src(objects.top_messages_node_image, &img_lock_slash_image,
-                                          LV_PART_MAIN | LV_STATE_DEFAULT);
-            break;
-        }
-        unreadMessages = 0; // TODO: not all messages may be actually read
-        updateUnreadMessages();
+
+    // panel may be virtualized away; fall back to the node data model
+    auto itPanel = nodes.find(nodeNum);
+    lv_obj_t *p = (itPanel != nodes.end()) ? itPanel->second : nullptr;
+    long keyState = -1;
+    char nameBuf[16];
+    const char *name = nullptr;
+    if (p && p->spec_attr && p->spec_attr->child_cnt > node_bat_idx) {
+        name = lv_label_get_text(p->LV_OBJ_IDX(node_lbl_idx));
+        keyState = (long)(unsigned long)p->LV_OBJ_IDX(node_bat_idx)->user_data;
     } else {
-        // TODO: log error
+        auto nd = nodeData.find(nodeNum);
+        if (nd != nodeData.end()) {
+            if (!nd->second.longName.empty())
+                name = nd->second.longName.c_str();
+            keyState = nd->second.hasKey ? 1 : 0;
+        }
     }
+    if (!name || !name[0]) {
+        snprintf(nameBuf, sizeof(nameBuf), "%04x", (unsigned)(nodeNum & 0xffff));
+        name = nameBuf;
+    }
+    lv_label_set_text(objects.top_messages_node_label, name);
+    ui_set_active(objects.messages_button, objects.messages_panel, objects.top_messages_panel);
+    switch (keyState) {
+    case 0:
+        lv_obj_set_style_bg_image_src(objects.top_messages_node_image, &img_lock_channel_image, LV_PART_MAIN | LV_STATE_DEFAULT);
+        break;
+    case 1:
+        lv_obj_set_style_bg_image_src(objects.top_messages_node_image, &img_lock_secure_image, LV_PART_MAIN | LV_STATE_DEFAULT);
+        break;
+    default:
+        lv_obj_set_style_bg_image_src(objects.top_messages_node_image, &img_lock_slash_image, LV_PART_MAIN | LV_STATE_DEFAULT);
+        break;
+    }
+    unreadMessages = 0; // TODO: not all messages may be actually read
+    updateUnreadMessages();
 }
 
 /**
@@ -7313,6 +7590,23 @@ void TFTView_320x240::disablePanel(lv_obj_t *panel)
 /**
  * Set focus to first button of a panel
  */
+void TFTView_320x240::navFocusActivePanel(void)
+{
+    if (THIS && THIS->activePanel)
+        THIS->setGroupFocus(THIS->activePanel);
+}
+
+// trackball up/down at the edge of the focusable widgets: scroll the page content
+// instead (most useful for reading the chat history in the messages panel)
+bool TFTView_320x240::navScrollActiveContent(int8_t dir)
+{
+    if (THIS && THIS->activePanel == objects.messages_panel && THIS->activeMsgContainer) {
+        lv_obj_scroll_by_bounded(THIS->activeMsgContainer, 0, dir > 0 ? -40 : 40, LV_ANIM_ON);
+        return true;
+    }
+    return false;
+}
+
 void TFTView_320x240::setGroupFocus(lv_obj_t *panel)
 {
     if (panel == objects.home_panel) {
@@ -7324,8 +7618,12 @@ void TFTView_320x240::setGroupFocus(lv_obj_t *panel)
     } else if (panel == objects.messages_panel) {
         lv_group_focus_obj(objects.message_input_area);
     } else if (panel == objects.chats_panel) {
-        if (chats.size() > 0) {
-            lv_group_focus_obj(panel->spec_attr->children[1]); // TODO: does not work
+        // focus the newest chat button (chat buttons are direct children, newest at index 0)
+        for (uint32_t i = 0; i < lv_obj_get_child_count(panel); i++) {
+            if (panel->spec_attr->children[i]->class_p == &lv_button_class) {
+                lv_group_focus_obj(panel->spec_attr->children[i]);
+                break;
+            }
         }
     } else if (panel == objects.map_panel) {
     } else if (panel == objects.settings_screen_lock_panel) {
@@ -7372,11 +7670,20 @@ void TFTView_320x240::removeNode(uint32_t nodeNum)
 {
     auto it = nodes.find(nodeNum);
     if (it != nodes.end()) {
-        lv_obj_del(it->second);
+        if (it->second && it->second != objects.node_panel) {
+            if (it->second == currentPanel) {
+                currentPanel = nullptr;
+                currentNode = 0;
+            }
+            lv_obj_del(it->second);
+            if (nodeCount > 0)
+                nodeCount--;
+        }
         nodes.erase(it);
     }
     removeFromMap(nodeNum);
     nodeData.erase(nodeNum);
+    nodesChanged = true;
 }
 
 void TFTView_320x240::setNodeImage(uint32_t nodeNum, eRole role, bool unmessagable, lv_obj_t *img)
@@ -7432,12 +7739,14 @@ void TFTView_320x240::setNodeImage(uint32_t nodeNum, eRole role, bool unmessagab
 
 void TFTView_320x240::updateNodesStatus(void)
 {
+    // nodeCount only counts materialized panels; the data model holds all nodes
+    int total = std::max((int)nodeCount, (int)nodeData.size());
     char buf[40];
-    lv_snprintf(buf, sizeof(buf), _p("%d of %d nodes online", nodeCount), nodesOnline, nodeCount);
+    lv_snprintf(buf, sizeof(buf), _p("%d of %d nodes online", total), nodesOnline, total);
     lv_label_set_text(objects.home_nodes_label, buf);
 
     if (nodesFiltered)
-        lv_snprintf(buf, sizeof(buf), _("Filter: %d of %d nodes"), nodeCount - nodesFiltered, nodeCount);
+        lv_snprintf(buf, sizeof(buf), _("Filter: %d of %d nodes"), total - nodesFiltered, total);
     lv_label_set_text(objects.top_nodes_online_label, buf);
 }
 
@@ -7490,25 +7799,34 @@ void TFTView_320x240::updateNodesFiltered(bool reset)
 
 void TFTView_320x240::updateLastHeard(uint32_t nodeNum)
 {
+    auto nd = nodeData.find(nodeNum);
     auto it = nodes.find(nodeNum);
-    if (it != nodes.end() && it->second) {
-        auto &rec = getOrCreateNodeRecord(nodeNum);
-        time_t prevLastHeard = rec.lastHeard ? rec.lastHeard : (time_t)it->second->LV_OBJ_IDX(node_lh_idx)->user_data;
-        rec.lastHeard = curtime;
+    if (nd == nodeData.end() && it == nodes.end())
+        return; // unknown node; don't create ghost records
 
+    // keep the data model current even when the panel is virtualized away,
+    // otherwise the sort order goes stale for off-screen nodes
+    time_t prevLastHeard = 0;
+    if (nd != nodeData.end()) {
+        prevLastHeard = nd->second.lastHeard;
+        nd->second.lastHeard = curtime;
+    }
+    if (it != nodes.end() && it->second) {
+        if (!prevLastHeard)
+            prevLastHeard = (time_t)it->second->LV_OBJ_IDX(node_lh_idx)->user_data;
         it->second->LV_OBJ_IDX(node_lh_idx)->user_data = (void *)curtime;
         lv_label_set_text(it->second->LV_OBJ_IDX(node_lh_idx), _("now"));
-        if (it->first != ownNode) {
-            if (prevLastHeard > 0 && curtime - prevLastHeard >= secs_until_offline) {
-                nodesOnline++;
-                applyNodesFilter(nodeNum);
-                updateNodesStatus();
-            }
-            // With virtualized nodes list we don't "move to top" directly.
-            // Debounce a resort instead.
-            nodesResortPending = true;
-            nextNodesResortMs = millis() + 150;
+    }
+    if (nodeNum != ownNode) {
+        if (prevLastHeard > 0 && curtime - prevLastHeard >= secs_until_offline) {
+            nodesOnline++;
+            applyNodesFilter(nodeNum);
+            updateNodesStatus();
         }
+        // With virtualized nodes list we don't "move to top" directly.
+        // Debounce a resort instead.
+        nodesResortPending = true;
+        nextNodesResortMs = millis() + 150;
     }
 }
 
@@ -7518,9 +7836,11 @@ void TFTView_320x240::updateLastHeard(uint32_t nodeNum)
  */
 void TFTView_320x240::updateAllLastHeard(void)
 {
-    uint16_t online = 0;
+    // refresh the labels of the materialized panels
     time_t lastHeard;
     for (auto it : nodes) {
+        if (!it.second)
+            continue;
         char buf[32];
         if (it.first == ownNode) { // own node is always now, so do update
             lastHeard = curtime;
@@ -7529,12 +7849,20 @@ void TFTView_320x240::updateAllLastHeard(void)
             lastHeard = (time_t)it.second->LV_OBJ_IDX(node_lh_idx)->user_data;
         }
         if (lastHeard) {
-            bool isOnline = lastHeardToString(lastHeard, buf);
+            lastHeardToString(lastHeard, buf);
             lv_label_set_text(it.second->LV_OBJ_IDX(node_lh_idx), buf);
-            if (isOnline)
-                online++;
         }
     }
+    // count online across ALL nodes, including the virtualized-away ones
+    uint16_t online = 0;
+    for (auto &kv : nodeData) {
+        lastHeard = (kv.first == ownNode) ? curtime : (time_t)kv.second.lastHeard;
+        if (lastHeard && curtime - lastHeard <= secs_until_offline)
+            online++;
+    }
+    // own node may not have a data record yet but is always online
+    if (ownNode && nodeData.find(ownNode) == nodeData.end() && nodes.find(ownNode) != nodes.end())
+        online++;
     nodesOnline = online;
     updateNodesFiltered(true);
     updateNodesStatus();
@@ -7733,11 +8061,229 @@ void TFTView_320x240::updateFreeMem(void)
     }
 }
 
+// -------- keyboard backlight (e.g. T-Deck): 0 = auto, 1 = always on, 2 = always off --------
+
+void TFTView_320x240::initKbBacklight(void)
+{
+#ifdef INPUTDRIVER_KB_BL_PIN
+    if (kbBacklightLabel) // already initialized (setupUIConfig may run more than once)
+        return;
+    pinMode(INPUTDRIVER_KB_BL_PIN, OUTPUT);
+    digitalWrite(INPUTDRIVER_KB_BL_PIN, LOW);
+    kbBacklightState = false;
+
+    // restore persisted mode
+    File f = fileSystem.open("/kbbacklight", "r");
+    if (f) {
+        int c = f.read();
+        if (c >= '0' && c <= '2')
+            kbBacklightMode = c - '0';
+        f.close();
+    }
+
+    // settings row in basic settings (styled like the generated rows)
+    lv_obj_t *btn = lv_btn_create(objects.tab_page_basic_settings);
+    lv_obj_set_size(btn, LV_PCT(95), 30);
+    add_style_settings_button_style(btn);
+    lv_obj_set_style_align(btn, LV_ALIGN_TOP_MID, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_shadow_width(btn, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0xff4db270), LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_text_color(btn, lv_color_hex(0xff015114), LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_add_event_cb(btn, ui_event_kb_backlight_button, LV_EVENT_CLICKED, NULL);
+
+    kbBacklightLabel = lv_label_create(btn);
+    lv_obj_set_size(kbBacklightLabel, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_label_set_long_mode(kbBacklightLabel, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_align(kbBacklightLabel, LV_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    setKbBacklightMode(kbBacklightMode); // updates label, persists and drives the pin
+#endif
+}
+
+void TFTView_320x240::setKbBacklightMode(uint8_t mode)
+{
+#ifdef INPUTDRIVER_KB_BL_PIN
+    kbBacklightMode = mode % 3;
+    if (kbBacklightLabel) {
+        static const char *names[3] = {"Auto", "On", "Off"};
+        char buf[40];
+        lv_snprintf(buf, sizeof(buf), _("Keyboard light: %s"), _(names[kbBacklightMode]));
+        lv_label_set_text(kbBacklightLabel, buf);
+    }
+    File f = fileSystem.open("/kbbacklight", "w");
+    if (f) {
+        f.write((uint8_t)('0' + kbBacklightMode));
+        f.close();
+    }
+    applyKbBacklight(true); // mode changed: write the pin unconditionally
+#endif
+}
+
+void TFTView_320x240::applyKbBacklight(bool force)
+{
+#ifdef INPUTDRIVER_KB_BL_PIN
+    bool want;
+    if (kbBacklightMode == 1)
+        want = true;
+    else if (kbBacklightMode == 2)
+        want = false;
+    else // auto: light while the device is in use (any touch/trackball/key within the last seconds)
+        want = lv_display_get_inactive_time(NULL) < 8000;
+    if (force || want != kbBacklightState) {
+        kbBacklightState = want;
+        digitalWrite(INPUTDRIVER_KB_BL_PIN, want ? HIGH : LOW);
+#if defined(ARCH_ESP32) && defined(INPUTDRIVER_I2C_KBD_TYPE)
+        // LilyGo T-Deck keyboard MCU drives its own backlight LEDs; newer keyboard
+        // firmware accepts an I2C brightness command: [0x01, level 0..255]
+        Wire.beginTransmission(INPUTDRIVER_I2C_KBD_TYPE);
+        Wire.write((uint8_t)0x01);
+        Wire.write((uint8_t)(want ? 200 : 0));
+        Wire.endTransmission();
+#endif
+    }
+#endif
+}
+
+void TFTView_320x240::ui_event_kb_backlight_button(lv_event_t *e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        THIS->setKbBacklightMode((THIS->kbBacklightMode + 1) % 3);
+    }
+}
+
+// -------- on-device wifi scan --------
+
+void TFTView_320x240::initWifiScanUI(void)
+{
+#if defined(ARCH_ESP32)
+    if (wifiScanButton)
+        return;
+    wifiScanButton = lv_btn_create(objects.settings_wifi_panel);
+    lv_obj_set_size(wifiScanButton, 64, 22);
+    lv_obj_align(wifiScanButton, LV_ALIGN_TOP_RIGHT, 0, -6);
+    lv_obj_set_style_shadow_width(wifiScanButton, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_add_event_cb(wifiScanButton, ui_event_wifi_scan_button, LV_EVENT_CLICKED, NULL);
+
+    wifiScanButtonLabel = lv_label_create(wifiScanButton);
+    lv_label_set_text(wifiScanButtonLabel, _("Scan"));
+    lv_obj_center(wifiScanButtonLabel);
+#endif
+}
+
+void TFTView_320x240::ui_event_wifi_scan_button(lv_event_t *e)
+{
+#if defined(ARCH_ESP32)
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED || THIS->wifiScanRunning)
+        return;
+    THIS->closeWifiScanList();
+    WiFi.mode(WIFI_STA);
+    WiFi.scanNetworks(true /*async*/);
+    THIS->wifiScanRunning = true;
+    lv_label_set_text(THIS->wifiScanButtonLabel, "...");
+#endif
+}
+
+void TFTView_320x240::pollWifiScan(void)
+{
+#if defined(ARCH_ESP32)
+    if (!wifiScanRunning)
+        return;
+    int16_t n = WiFi.scanComplete();
+    if (n == WIFI_SCAN_RUNNING)
+        return;
+    wifiScanRunning = false;
+    if (wifiScanButtonLabel)
+        lv_label_set_text(wifiScanButtonLabel, _("Scan"));
+    // user left the wifi page while the scan was in flight: drop the results silently
+    if (activeSettings != eWifi || lv_obj_has_flag(objects.settings_wifi_panel, LV_OBJ_FLAG_HIDDEN)) {
+        WiFi.scanDelete();
+        return;
+    }
+    if (n <= 0) {
+        WiFi.scanDelete();
+        messageAlert(_("No networks found"), true);
+        return;
+    }
+
+    // sort by signal strength, strongest first
+    std::vector<int> order(n);
+    for (int i = 0; i < n; i++)
+        order[i] = i;
+    std::sort(order.begin(), order.end(), [](int a, int b) { return WiFi.RSSI(a) > WiFi.RSSI(b); });
+
+    wifiScanList = lv_list_create(objects.main_screen);
+    lv_obj_set_size(wifiScanList, 250, 180);
+    lv_obj_center(wifiScanList);
+    lv_obj_set_style_border_width(wifiScanList, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_border_color(wifiScanList, colorMesh, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    wifiScanSSIDs.clear();
+    std::set<std::string> seen;
+    for (int k = 0; k < n; k++) {
+        int i = order[k];
+        std::string ssid = WiFi.SSID(i).c_str();
+        if (ssid.empty() || seen.find(ssid) != seen.end())
+            continue;
+        seen.insert(ssid);
+        wifiScanSSIDs.push_back(ssid);
+
+        char buf[48];
+        bool open = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+        snprintf(buf, sizeof(buf), "%s  (%d)%s", ssid.c_str(), (int)WiFi.RSSI(i), open ? "" : " " LV_SYMBOL_EYE_CLOSE);
+        lv_obj_t *b = lv_list_add_button(wifiScanList, LV_SYMBOL_WIFI, buf);
+        lv_obj_add_event_cb(b, ui_event_wifi_scan_select, LV_EVENT_CLICKED, (void *)(uintptr_t)(wifiScanSSIDs.size() - 1));
+    }
+    lv_obj_t *cancel = lv_list_add_button(wifiScanList, LV_SYMBOL_CLOSE, _("Cancel"));
+    lv_obj_add_event_cb(cancel, ui_event_wifi_scan_select, LV_EVENT_CLICKED, (void *)(uintptr_t)UINT32_MAX);
+
+    WiFi.scanDelete();
+#endif
+}
+
+void TFTView_320x240::ui_event_wifi_scan_select(lv_event_t *e)
+{
+#if defined(ARCH_ESP32)
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+        return;
+    uint32_t idx = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+    if (idx < THIS->wifiScanSSIDs.size()) {
+        lv_textarea_set_text(objects.settings_wifi_ssid_textarea, THIS->wifiScanSSIDs[idx].c_str());
+        lv_textarea_set_text(objects.settings_wifi_password_textarea, "");
+        THIS->closeWifiScanList();
+        lv_group_focus_obj(objects.settings_wifi_password_textarea);
+        THIS->showKeyboard(objects.settings_wifi_password_textarea);
+        // without a hardware keyboard the on-screen keyboard must be made visible too
+        if (!THIS->inputdriver->hasKeyboardDevice())
+            lv_obj_remove_flag(objects.keyboard, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        THIS->closeWifiScanList();
+    }
+#endif
+}
+
+void TFTView_320x240::closeWifiScanList(void)
+{
+    if (wifiScanList) {
+        lv_obj_delete(wifiScanList);
+        wifiScanList = nullptr;
+    }
+    wifiScanSSIDs.clear();
+    wifiScanRunning = false; // ignore any scan still in flight
+    if (wifiScanButtonLabel)
+        lv_label_set_text(wifiScanButtonLabel, _("Scan"));
+#if defined(ARCH_ESP32)
+    WiFi.scanDelete();
+#endif
+}
+
 void TFTView_320x240::task_handler(void)
 {
     MeshtasticView::task_handler();
 
     if (screensInitialised) {
+        applyKbBacklight();
+        pollWifiScan();
+
         if (map)
             map->task_handler();
 

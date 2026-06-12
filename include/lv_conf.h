@@ -83,7 +83,7 @@
  *====================*/
 
 /*Default display refresh, input device read and animation step period.*/
-#define LV_DEF_REFR_PERIOD  33      /*[ms]*/ //Switch to 30 fps
+#define LV_DEF_REFR_PERIOD  20      /*[ms]*/ // 50 fps target for a snappier UI (was 33/30fps)
 
 /*Default Dot Per Inch. Used to initialize default sizes such as widgets sized, style paddings.
  *(Not so important, you can adjust it to modify default sizes and spaces)*/

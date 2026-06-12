@@ -87,15 +87,24 @@ void EncoderInputDriver::encoder_read(lv_indev_t *indev, lv_indev_data_t *data)
                 data->key = LV_KEY_ENTER;
                 data->state = LV_INDEV_STATE_PRESSED;
             } else if (action == TB_ACTION_UP) {
-                data->enc_diff = -1;
+                // keep vertical focus moves inside the current region (menu or page)
+                if (!navBlockBoundary(-1))
+                    data->enc_diff = -1;
             } else if (action == TB_ACTION_DOWN) {
-                data->enc_diff = 1;
+                if (!navBlockBoundary(1))
+                    data->enc_diff = 1;
             } else if (action == TB_ACTION_LEFT) {
-                data->key = LV_KEY_DOWN; // slider widget reacts on UP/DOWN
-                data->state = LV_INDEV_STATE_PRESSED;
+                // gesture: swipe left jumps back to the menu column
+                if (!navFocusMenu()) {
+                    data->key = LV_KEY_DOWN; // slider widget reacts on UP/DOWN
+                    data->state = LV_INDEV_STATE_PRESSED;
+                }
             } else if (action == TB_ACTION_RIGHT) {
-                data->key = LV_KEY_UP; // slider widget reacts on UP/DOWN
-                data->state = LV_INDEV_STATE_PRESSED;
+                // gesture: swipe right jumps from the menu into the page content
+                if (!navFocusContent()) {
+                    data->key = LV_KEY_UP; // slider widget reacts on UP/DOWN
+                    data->state = LV_INDEV_STATE_PRESSED;
+                }
             }
 
             lastPressed = millis();

@@ -181,7 +181,7 @@ class MeshtasticView : public DeviceGUI
         uint32_t sats = 0;
         uint32_t precision = 0;
         bool hasPosition = false;
-        uint8_t hopsAway = 0;
+        int8_t hopsAway = -1; // -1 = unknown, 0 = heard directly (matches panel user_data semantics)
 
         uint32_t batLevel = 0;
         float voltage = 0.0f;
