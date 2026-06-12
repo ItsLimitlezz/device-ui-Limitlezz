@@ -83,33 +83,61 @@ void EncoderInputDriver::encoder_read(lv_indev_t *indev, lv_indev_data_t *data)
         // slow down repeating key to max. four events per second
         // the button is an exception for LONG_PRESSED monitoring
         if (action != TB_ACTION_NONE && (action == TB_ACTION_PRESSED || millis() > lastPressed + 250)) {
-            if (action == TB_ACTION_PRESSED) {
-                data->key = LV_KEY_ENTER;
-                data->state = LV_INDEV_STATE_PRESSED;
-            } else if (action == TB_ACTION_UP) {
-                // keep vertical focus moves inside the current region (menu or page)
-                if (!navBlockBoundary(-1))
-                    data->enc_diff = -1;
-            } else if (action == TB_ACTION_DOWN) {
-                if (!navBlockBoundary(1))
-                    data->enc_diff = 1;
-            } else if (action == TB_ACTION_LEFT) {
-                // gesture: swipe left jumps back to the menu column
-                if (!navFocusMenu()) {
-                    data->key = LV_KEY_DOWN; // slider widget reacts on UP/DOWN
-                    data->state = LV_INDEV_STATE_PRESSED;
-                }
-            } else if (action == TB_ACTION_RIGHT) {
-                // gesture: swipe right jumps from the menu into the page content
-                if (!navFocusContent()) {
-                    data->key = LV_KEY_UP; // slider widget reacts on UP/DOWN
-                    data->state = LV_INDEV_STATE_PRESSED;
+            EncoderActionType act = action;
+            action = TB_ACTION_NONE; // consume
+
+            // Trackball "numbing": absorb a single accidental reversal pulse while
+            // actively scrolling (e.g. a tiny opposite knock when re-gripping the ball).
+            // ONLY an up<->down reversal within the guard window needs a second pulse to
+            // confirm; gestures (left/right), presses, same-direction movement and fresh
+            // moves after a pause all act immediately.
+            static EncoderActionType lastVertical = TB_ACTION_NONE;
+            static EncoderActionType pendingReversal = TB_ACTION_NONE;
+            static uint32_t lastVerticalMs = 0;
+            const uint32_t NUMB_GUARD_MS = 400;
+
+            bool actNow = true;
+            if (act == TB_ACTION_UP || act == TB_ACTION_DOWN) {
+                uint32_t now = millis();
+                bool isReversal = (lastVertical == TB_ACTION_UP || lastVertical == TB_ACTION_DOWN) && act != lastVertical;
+                if (isReversal && (now - lastVerticalMs) < NUMB_GUARD_MS && pendingReversal != act) {
+                    pendingReversal = act; // first reversal pulse mid-scroll: absorb it
+                    actNow = false;
+                } else {
+                    pendingReversal = TB_ACTION_NONE;
+                    lastVertical = act;
+                    lastVerticalMs = now;
                 }
             }
 
-            lastPressed = millis();
-            prevkey = data->key;
-            action = TB_ACTION_NONE;
+            if (actNow) {
+                if (act == TB_ACTION_PRESSED) {
+                    data->key = LV_KEY_ENTER;
+                    data->state = LV_INDEV_STATE_PRESSED;
+                } else if (act == TB_ACTION_UP) {
+                    // keep vertical focus moves inside the current region (menu or page)
+                    if (!navBlockBoundary(-1))
+                        data->enc_diff = -1;
+                } else if (act == TB_ACTION_DOWN) {
+                    if (!navBlockBoundary(1))
+                        data->enc_diff = 1;
+                } else if (act == TB_ACTION_LEFT) {
+                    // gesture: swipe left jumps back to the menu column
+                    if (!navFocusMenu()) {
+                        data->key = LV_KEY_DOWN; // slider widget reacts on UP/DOWN
+                        data->state = LV_INDEV_STATE_PRESSED;
+                    }
+                } else if (act == TB_ACTION_RIGHT) {
+                    // gesture: swipe right jumps from the menu into the page content
+                    if (!navFocusContent()) {
+                        data->key = LV_KEY_UP; // slider widget reacts on UP/DOWN
+                        data->state = LV_INDEV_STATE_PRESSED;
+                    }
+                }
+
+                lastPressed = millis();
+                prevkey = data->key;
+            }
         } else {
             // this logic is required for LONG_PRESSED event, see lv_indev.c
             if (prevkey != 0) {

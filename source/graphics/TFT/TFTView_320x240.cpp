@@ -6283,6 +6283,31 @@ void TFTView_320x240::refreshVirtualNodes(bool force)
         insertIdx++;
     }
 
+    // Re-sync the input group's focus order with the visual order. Panels recycled while
+    // scrolling UP are appended at the group tail even though they sit at the top of the
+    // screen, which would make trackball up/down run backwards through the list.
+    lv_group_t *grp = lv_group_get_default();
+    if (grp && windowSlice.size() > 1) {
+        lv_ll_t *gll = &grp->obj_ll;
+        std::unordered_map<lv_obj_t *, void *> llOf; // button object -> its group list node
+        for (void *n = _lv_ll_get_head(gll); n; n = _lv_ll_get_next(gll, n))
+            llOf[*(lv_obj_t **)n] = n;
+        auto buttonNodeOf = [&](uint32_t num) -> void * {
+            auto itp = nodes.find(num);
+            if (itp == nodes.end() || !itp->second || !itp->second->spec_attr ||
+                itp->second->spec_attr->child_cnt <= node_btn_idx)
+                return nullptr;
+            auto bit = llOf.find(itp->second->LV_OBJ_IDX(node_btn_idx));
+            return bit != llOf.end() ? bit->second : nullptr;
+        };
+        for (int k = (int)windowSlice.size() - 1; k > 0; k--) {
+            void *prev = buttonNodeOf(windowSlice[k - 1]);
+            void *next = buttonNodeOf(windowSlice[k]);
+            if (prev && next && prev != next && _lv_ll_get_next(gll, prev) != next)
+                _lv_ll_move_before(gll, prev, next);
+        }
+    }
+
     nodesLastWindow = std::move(windowSlice);
     nodesLastFirst = wantFirst;
     nodesLastTotal = total;
@@ -7236,6 +7261,33 @@ void TFTView_320x240::addChat(uint32_t from, uint32_t to, uint8_t ch)
     lv_obj_set_style_bg_color(chatBtn, lv_color_hex(0xff141723), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_move_to_index(chatBtn, 0);
 
+    // Keep the trackball focus order in sync with the visual order (newest chat on top).
+    // A new chat button is added at the group's tail but moved to visual index 0, which
+    // would otherwise make up/down navigation run backwards on this page. Move this
+    // button's group entry just ahead of the current top-most chat so focus follows the list.
+    {
+        lv_group_t *grp = lv_group_get_default();
+        if (grp && !chats.empty()) {
+            lv_ll_t *gll = &grp->obj_ll;
+            void *moveNode = nullptr, *beforeNode = nullptr;
+            for (void *n = _lv_ll_get_head(gll); n && !(moveNode && beforeNode); n = _lv_ll_get_next(gll, n)) {
+                lv_obj_t *o = *(lv_obj_t **)n;
+                if (o == chatBtn) {
+                    moveNode = n;
+                } else if (!beforeNode) {
+                    for (auto &kv : chats) {
+                        if (kv.second == o) {
+                            beforeNode = n;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (moveNode && beforeNode && moveNode != beforeNode)
+                _lv_ll_move_before(gll, moveNode, beforeNode);
+        }
+    }
+
     char buf[64];
     if (to == UINT32_MAX || from == 0) {
         sprintf(buf, "%d: %s", (int)ch, lv_label_get_text(channel[ch]));
@@ -7601,7 +7653,8 @@ void TFTView_320x240::navFocusActivePanel(void)
 bool TFTView_320x240::navScrollActiveContent(int8_t dir)
 {
     if (THIS && THIS->activePanel == objects.messages_panel && THIS->activeMsgContainer) {
-        lv_obj_scroll_by_bounded(THIS->activeMsgContainer, 0, dir > 0 ? -40 : 40, LV_ANIM_ON);
+        // ~half a screen per trackball tick for faster chat-history scrolling
+        lv_obj_scroll_by_bounded(THIS->activeMsgContainer, 0, dir > 0 ? -100 : 100, LV_ANIM_ON);
         return true;
     }
     return false;

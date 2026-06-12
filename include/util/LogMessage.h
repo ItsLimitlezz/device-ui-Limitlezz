@@ -65,6 +65,12 @@ class LogMessageEnv : public LogMessage
     {
         size_t len = read((uint8_t *)&_size, sizeof(LogMessageHeader) - 8);
         if (len) {
+            // Guard against corrupt or layout-incompatible entries (e.g. message logs
+            // written by a firmware with a different time_t width / struct ABI). A bogus
+            // _size would otherwise overflow bytes[] here and via msg.length() downstream
+            // (memcpy/strlen in restoreMessage), causing a LoadProhibited crash.
+            if (_size >= messagePayloadSize)
+                _size = messagePayloadSize - 1;
             len += read(bytes, _size);
             bytes[_size] = 0;
         } else {
